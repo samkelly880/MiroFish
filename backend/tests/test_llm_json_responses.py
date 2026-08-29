@@ -2,7 +2,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from app.utils.llm_client import LLMClient, LLMResponseError
+from app.providers.openai_compat import OpenAICompatProvider, LLMResponseError
 
 
 class CompletionSequence:
@@ -38,7 +38,7 @@ def _response(content, *, finish_reason="stop", include_choice=True):
 
 
 def _client_for(sequence):
-    client = object.__new__(LLMClient)
+    client = object.__new__(OpenAICompatProvider)
     client.model = "compatible-model"
     client.client = SimpleNamespace(
         chat=SimpleNamespace(completions=sequence)

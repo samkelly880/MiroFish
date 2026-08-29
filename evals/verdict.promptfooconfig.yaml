@@ -1,0 +1,46 @@
+description: "MiroFish verdict.json structured output"
+
+prompts:
+  - |
+    Extract a structured verdict from a simulation report.
+    Return JSON with exactly:
+    prediction (string), confidence (0-1 number), key_dynamics (string[]),
+    signals (string[]), insufficient_data (boolean).
+    Requirement: {{requirement}}
+    Report:
+    {{report}}
+
+providers:
+  - id: openai:chat:{{env.OPENAI_MODEL}}
+    config:
+      apiKey: "{{env.OPENAI_API_KEY}}"
+      apiBaseUrl: "{{env.OPENAI_BASE_URL}}"
+      temperature: 0.2
+      response_format:
+        type: json_object
+
+tests:
+  - vars:
+      requirement: "How do businesses react to a congestion fee?"
+      report: |
+        ## Summary
+        Business accounts amplified concerns about foot traffic within 24 hours.
+        Activist clusters framed the fee as climate progress.
+        Cross-platform quote posts increased polarization.
+    assert:
+      - type: is-json
+      - type: javascript
+        value: |
+          const o = JSON.parse(output);
+          const conf = Number(o.confidence);
+          return typeof o.prediction==='string' && conf>=0 && conf<=1 && Array.isArray(o.key_dynamics) && Array.isArray(o.signals) && typeof o.insufficient_data==='boolean';
+  - vars:
+      requirement: "Predict outcome"
+      report: "N/A"
+    assert:
+      - type: is-json
+      - type: javascript
+        value: |
+          const o = JSON.parse(output);
+          // Weak reports should either flag insufficient_data or use low confidence
+          return o.insufficient_data === true || Number(o.confidence) <= 0.3;

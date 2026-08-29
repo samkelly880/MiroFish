@@ -983,58 +983,29 @@ def _get_comment_info(
 
 def create_model(config: Dict[str, Any], use_boost: bool = False):
     """
-    Create an LLM model
-    
-    Supports dual LLM configs to speed up parallel simulation:
-    - Primary: LLM_API_KEY, LLM_BASE_URL, LLM_MODEL_NAME
-    - Boost (optional): LLM_BOOST_API_KEY, LLM_BOOST_BASE_URL, LLM_BOOST_MODEL_NAME
-    
-    With a boost LLM, parallel runs can use different API providers per platform for higher concurrency.
-    
-    Args:
-        config: Simulation config dict
-        use_boost: Whether to use boost LLM config when available
+    Create an LLM model for OASIS agents.
+
+    Primary provider is grok-cli (JSON action bridge). When
+    LLM_PROVIDER=openai-compatible, uses HTTP OpenAI-compatible APIs.
+    Optional boost LLM credentials still apply only in API mode.
     """
-    # Check whether boost config exists
-    boost_api_key = os.environ.get("LLM_BOOST_API_KEY", "")
-    boost_base_url = os.environ.get("LLM_BOOST_BASE_URL", "")
-    boost_model = os.environ.get("LLM_BOOST_MODEL_NAME", "")
-    has_boost_config = bool(boost_api_key)
-    
-    # Choose which LLM config to use
-    if use_boost and has_boost_config:
-        # Use boost config
-        llm_api_key = boost_api_key
-        llm_base_url = boost_base_url
-        llm_model = boost_model or os.environ.get("LLM_MODEL_NAME", "")
-        config_label = "[Boost LLM]"
-    else:
-        # Use primary config
-        llm_api_key = os.environ.get("LLM_API_KEY", "")
-        llm_base_url = os.environ.get("LLM_BASE_URL", "")
-        llm_model = os.environ.get("LLM_MODEL_NAME", "")
-        config_label = "[Primary LLM]"
-    
-    # If .env has no model name, fall back to config
-    if not llm_model:
-        llm_model = config.get("llm_model", "gpt-4o-mini")
-    
-    # Set env vars required by camel-ai
-    if llm_api_key:
-        os.environ["OPENAI_API_KEY"] = llm_api_key
-    
-    if not os.environ.get("OPENAI_API_KEY"):
-        raise ValueError("Missing API Key; set LLM_API_KEY in the project-root .env file")
-    
-    if llm_base_url:
-        os.environ["OPENAI_API_BASE_URL"] = llm_base_url
-    
-    print(f"{config_label} model={llm_model}, base_url={llm_base_url[:40] if llm_base_url else 'default'}...")
-    
-    return ModelFactory.create(
-        model_platform=ModelPlatformType.OPENAI,
-        model_type=llm_model,
-    )
+    from app.providers.factory import get_provider_name
+    from app.providers.oasis_bridge import create_oasis_model
+
+    provider = get_provider_name()
+    if provider == "openai-compatible" and use_boost:
+        boost_api_key = os.environ.get("LLM_BOOST_API_KEY", "")
+        if boost_api_key:
+            os.environ["LLM_API_KEY"] = boost_api_key
+            if os.environ.get("LLM_BOOST_BASE_URL"):
+                os.environ["LLM_BASE_URL"] = os.environ["LLM_BOOST_BASE_URL"]
+            if os.environ.get("LLM_BOOST_MODEL_NAME"):
+                os.environ["LLM_MODEL_NAME"] = os.environ["LLM_BOOST_MODEL_NAME"]
+            print("[Boost LLM] openai-compatible")
+            return create_oasis_model(config, use_boost=True)
+
+    print(f"[Primary LLM] provider={provider}")
+    return create_oasis_model(config, use_boost=False)
 
 
 def get_active_agents_for_round(
