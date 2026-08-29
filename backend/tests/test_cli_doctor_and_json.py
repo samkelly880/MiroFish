@@ -7,8 +7,11 @@ from app.run_registry import RunRegistry
 
 
 def test_doctor_json_stdout(capsys, monkeypatch):
+    from app.config import Config
+
     monkeypatch.setenv("LLM_PROVIDER", "grok-cli")
     monkeypatch.delenv("ZEP_API_KEY", raising=False)
+    monkeypatch.setattr(Config, "ZEP_API_KEY", None)
     code = main(["doctor", "--json"])
     captured = capsys.readouterr()
     payload = json.loads(captured.out)
@@ -21,9 +24,13 @@ def test_doctor_json_stdout(capsys, monkeypatch):
 
 
 def test_doctor_does_not_require_api_key_for_grok(capsys, monkeypatch):
+    from app.config import Config
+
     monkeypatch.setenv("LLM_PROVIDER", "grok-cli")
     monkeypatch.delenv("LLM_API_KEY", raising=False)
     monkeypatch.setenv("ZEP_API_KEY", "test-zep")
+    monkeypatch.setattr(Config, "ZEP_API_KEY", "test-zep")
+    monkeypatch.setattr(Config, "LLM_API_KEY", None)
     code = main(["doctor", "--json"])
     payload = json.loads(capsys.readouterr().out)
     api_check = next(c for c in payload["checks"] if c["name"] == "openai_compatible")

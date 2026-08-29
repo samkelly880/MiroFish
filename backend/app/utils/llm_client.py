@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 
-from ..providers.factory import create_llm_client, get_provider_name
+from ..providers.factory import create_llm_client, get_provider_name, resolve_provider_name
 from ..providers.openai_compat import LLMResponseError
 
 __all__ = ["LLMClient", "LLMResponseError"]
@@ -29,11 +29,15 @@ class LLMClient:
         model: Optional[str] = None,
         provider: Optional[str] = None,
     ):
-        self.provider_name = get_provider_name() if provider is None else provider
+        self.provider_name = (
+            resolve_provider_name(provider)
+            if provider is not None
+            else get_provider_name()
+        )
         kwargs: Dict[str, Any] = {}
         if model is not None:
             kwargs["model"] = model
-        if self.provider_name in {"openai-compatible", "openai", "api", "http"}:
+        if self.provider_name == "openai-compatible":
             if api_key is not None:
                 kwargs["api_key"] = api_key
             if base_url is not None:

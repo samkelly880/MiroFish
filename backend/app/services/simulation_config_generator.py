@@ -17,12 +17,10 @@ from typing import Dict, Any, List, Optional, Callable
 from dataclasses import dataclass, field, asdict
 from datetime import datetime
 
-from openai import OpenAI
-
 from ..config import Config
 from ..utils.logger import get_logger
 from ..utils.locale import get_language_instruction, t
-from ..utils.openai_chat_compat import create_chat_completion, extract_chat_completion_text
+from ..utils.llm_client import LLMClient, LLMResponseError
 from .zep_entity_reader import EntityNode, ZepEntityReader
 
 logger = get_logger('mirofish.simulation_config')
@@ -228,19 +226,18 @@ class SimulationConfigGenerator:
         self,
         api_key: Optional[str] = None,
         base_url: Optional[str] = None,
-        model_name: Optional[str] = None
+        model_name: Optional[str] = None,
+        llm_client: Optional[LLMClient] = None,
     ):
+        # Provider-aware LLM (grok-cli primary; openai-compatible optional).
+        self.llm_client = llm_client or LLMClient(
+            api_key=api_key,
+            base_url=base_url,
+            model=model_name,
+        )
         self.api_key = api_key or Config.LLM_API_KEY
         self.base_url = base_url or Config.LLM_BASE_URL
-        self.model_name = model_name or Config.LLM_MODEL_NAME
-        
-        if not self.api_key:
-            raise ValueError("LLM_API_KEY is not configured")
-        
-        self.client = OpenAI(
-            api_key=self.api_key,
-            base_url=self.base_url
-        )
+        self.model_name = model_name or getattr(self.llm_client, "model", None) or Config.LLM_MODEL_NAME
     
     def generate_config(
         self,
@@ -434,53 +431,31 @@ class SimulationConfigGenerator:
         return "\n".join(lines)
     
     def _call_llm_with_retry(self, prompt: str, system_prompt: str) -> Dict[str, Any]:
-        """LLM call with retry, including JSON repair logic"""
-        import re
-        
+        """LLM call with retry via the configured provider."""
+        import time
+
         max_attempts = 3
         last_error = None
-        
+
         for attempt in range(max_attempts):
             try:
-                response = create_chat_completion(
-                    self.client,
-                    model=self.model_name,
+                return self.llm_client.chat_json(
                     messages=[
                         {"role": "system", "content": system_prompt},
                         {"role": "user", "content": prompt}
                     ],
-                    response_format={"type": "json_object"},
                     temperature=0.7 - (attempt * 0.1),  # Lower temperature on each retry
-                    # Do not set max_tokens; let the LLM generate freely
+                    max_tokens=None,
+                    max_attempts=1,
                 )
-                
-                content = extract_chat_completion_text(response)
-                finish_reason = response.choices[0].finish_reason
-                
-                # Check whether output was truncated
-                if finish_reason == 'length':
-                    logger.warning(f"LLM output truncated (attempt {attempt+1})")
-                    content = self._fix_truncated_json(content)
-                
-                # Try parsing JSON
-                try:
-                    return json.loads(content)
-                except json.JSONDecodeError as e:
-                    logger.warning(f"JSON parse failed (attempt {attempt+1}): {str(e)[:80]}")
-                    
-                    # Try to repair JSON
-                    fixed = self._try_fix_config_json(content)
-                    if fixed:
-                        return fixed
-                    
-                    last_error = e
-                    
+            except (LLMResponseError, json.JSONDecodeError, ValueError) as e:
+                logger.warning(f"JSON parse/LLM failed (attempt {attempt+1}): {str(e)[:80]}")
+                last_error = e
             except Exception as e:
                 logger.warning(f"LLM call failed (attempt {attempt+1}): {str(e)[:80]}")
                 last_error = e
-                import time
                 time.sleep(2 * (attempt + 1))
-        
+
         raise last_error or Exception("LLM call failed")
     
     def _fix_truncated_json(self, content: str) -> str:

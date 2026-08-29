@@ -15,11 +15,10 @@ from typing import Dict, Any, List, Optional
 from dataclasses import dataclass, field
 from datetime import datetime
 
-from openai import OpenAI
 from ..config import Config
 from ..utils.logger import get_logger
 from ..utils.locale import get_language_instruction, get_locale, set_locale, t
-from ..utils.openai_chat_compat import create_chat_completion, extract_chat_completion_text
+from ..utils.llm_client import LLMClient, LLMResponseError
 from ..utils.zep import (
     call_zep_read_with_retry,
     get_zep_client,
@@ -246,20 +245,20 @@ class OasisProfileGenerator:
         base_url: Optional[str] = None,
         model_name: Optional[str] = None,
         zep_api_key: Optional[str] = None,
-        graph_id: Optional[str] = None
+        graph_id: Optional[str] = None,
+        llm_client: Optional[LLMClient] = None,
     ):
+        # Provider-aware LLM (grok-cli primary; openai-compatible optional).
+        # Do not require LLM_API_KEY when LLM_PROVIDER=grok-cli.
+        self.llm_client = llm_client or LLMClient(
+            api_key=api_key,
+            base_url=base_url,
+            model=model_name,
+        )
         self.api_key = api_key or Config.LLM_API_KEY
         self.base_url = base_url or Config.LLM_BASE_URL
-        self.model_name = model_name or Config.LLM_MODEL_NAME
-        
-        if not self.api_key:
-            raise ValueError("LLM_API_KEY is not configured")
-        
-        self.client = OpenAI(
-            api_key=self.api_key,
-            base_url=self.base_url
-        )
-        
+        self.model_name = model_name or getattr(self.llm_client, "model", None) or Config.LLM_MODEL_NAME
+
         # Zep client used to retrieve richer context
         self.zep_api_key = zep_api_key or Config.ZEP_API_KEY
         self.zep_client = None
@@ -570,53 +569,30 @@ class OasisProfileGenerator:
         
         for attempt in range(max_attempts):
             try:
-                response = create_chat_completion(
-                    self.client,
-                    model=self.model_name,
+                result = self.llm_client.chat_json(
                     messages=[
                         {"role": "system", "content": self._get_system_prompt(is_individual)},
                         {"role": "user", "content": prompt}
                     ],
-                    response_format={"type": "json_object"},
                     temperature=0.7 - (attempt * 0.1),  # Lower temperature on each retry
-                    # Do not set max_tokens; let the LLM generate freely
+                    max_tokens=None,  # let the provider generate freely
+                    max_attempts=1,
                 )
-                
-                content = extract_chat_completion_text(response)
-                
-                # Check whether output was truncated (finish_reason is not 'stop')
-                finish_reason = response.choices[0].finish_reason
-                if finish_reason == 'length':
-                    logger.warning(f"LLM output truncated (attempt {attempt+1}), attempting repair...")
-                    content = self._fix_truncated_json(content)
-                
-                # Try parsing JSON
-                try:
-                    result = json.loads(content)
-                    
-                    # Validate required fields
-                    if "bio" not in result or not result["bio"]:
-                        result["bio"] = entity_summary[:200] if entity_summary else f"{entity_type}: {entity_name}"
-                    if "persona" not in result or not result["persona"]:
-                        result["persona"] = entity_summary or f"{entity_name} is a {entity_type}."
-                    
-                    return result
-                    
-                except json.JSONDecodeError as je:
-                    logger.warning(f"JSON parse failed (attempt {attempt+1}): {str(je)[:80]}")
-                    
-                    # Try to repair JSON
-                    result = self._try_fix_json(content, entity_name, entity_type, entity_summary)
-                    if result.get("_fixed"):
-                        del result["_fixed"]
-                        return result
-                    
-                    last_error = je
-                    
+
+                # Validate required fields
+                if "bio" not in result or not result["bio"]:
+                    result["bio"] = entity_summary[:200] if entity_summary else f"{entity_type}: {entity_name}"
+                if "persona" not in result or not result["persona"]:
+                    result["persona"] = entity_summary or f"{entity_name} is a {entity_type}."
+
+                return result
+
+            except (LLMResponseError, json.JSONDecodeError, ValueError) as e:
+                logger.warning(f"LLM persona JSON failed (attempt {attempt+1}): {str(e)[:80]}")
+                last_error = e
             except Exception as e:
                 logger.warning(f"LLM call failed (attempt {attempt+1}): {str(e)[:80]}")
                 last_error = e
-                import time
                 time.sleep(1 * (attempt + 1))  # Exponential backoff
         
         logger.warning(f"LLM persona generation failed ({max_attempts} attempts): {last_error}, falling back to rules")
