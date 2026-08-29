@@ -1310,6 +1310,19 @@ Return a JSON list of sub-questions."""
             interview_topic=interview_requirement,
             interview_questions=custom_questions or []
         )
+
+        # Explicit capability check before any LLM work. Finite CLI runs close
+        # OASIS before report generation; skip interviews when env is not alive.
+        if not SimulationRunner.check_env_alive(simulation_id):
+            logger.info(
+                "Skipping interview_agents LLM work: OASIS env not alive "
+                "(simulation_id=%s)",
+                simulation_id,
+            )
+            result.summary = (
+                "Interview skipped: OASIS simulation environment is not running."
+            )
+            return result
         
         # Step 1: Read persona files
         profiles = self._load_agent_profiles(simulation_id)

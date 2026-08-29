@@ -715,10 +715,7 @@ This section analyzes...
 {tools_description}
 
 [Tool Usage Advice - Mix Different Tools; Do Not Use Only One]
-- insight_forge: Deep insight analysis; automatically decomposes questions and retrieves facts and relationships across dimensions
-- panorama_search: Wide-angle panoramic search; understand the full picture, timeline, and evolution of an event
-- quick_search: Quickly verify a specific information point
-- interview_agents: Interview simulated Agents to get first-person viewpoints and real reactions from different roles
+{tool_usage_advice}
 
 ═══════════════════════════════════════════════════════════════
 [Workflow]
@@ -912,8 +909,9 @@ class ReportAgent:
         self.llm = llm_client or LLMClient()
         self.zep_tools = zep_tools or ZepToolsService()
         
-        # Tool definitions
+        # Tool definitions (full catalog; active set filtered by env capability)
         self.tools = self._define_tools()
+        self._interviews_available_cached: Optional[bool] = None
         
         # Logger (initialized in generate_report)
         self.report_logger: Optional[ReportLogger] = None
@@ -921,6 +919,43 @@ class ReportAgent:
         self.console_logger: Optional[ReportConsoleLogger] = None
         
         logger.info(t('report.agentInitDone', graphId=graph_id, simulationId=simulation_id))
+
+    def interviews_available(self) -> bool:
+        """
+        Return True when the OASIS simulation environment can accept interviews.
+
+        Uses the same env_status.json capability check as the simulation API
+        (`SimulationRunner.check_env_alive`). Cached for the lifetime of this
+        ReportAgent instance — once closed for a finite CLI run, it stays closed.
+        """
+        if self._interviews_available_cached is not None:
+            return self._interviews_available_cached
+        try:
+            from .simulation_runner import SimulationRunner
+
+            available = bool(
+                self.simulation_id
+                and SimulationRunner.check_env_alive(self.simulation_id)
+            )
+        except Exception as exc:  # noqa: BLE001 - treat probe failures as unavailable
+            logger.warning(
+                "Interview availability check failed for %s: %s",
+                self.simulation_id,
+                exc,
+            )
+            available = False
+        self._interviews_available_cached = available
+        return available
+
+    def _available_tools(self) -> Dict[str, Dict[str, Any]]:
+        """Tool catalog filtered by runtime capabilities."""
+        tools = dict(self.tools)
+        if not self.interviews_available():
+            tools.pop("interview_agents", None)
+        return tools
+
+    def _available_tool_names(self) -> set:
+        return set(self._available_tools().keys())
     
     def _define_tools(self) -> Dict[str, Dict[str, Any]]:
         """Define available tools."""
@@ -1013,6 +1048,17 @@ class ReportAgent:
             
             elif tool_name == "interview_agents":
                 # Deep interview - call real OASIS interview API for Agent answers (dual platform)
+                if not self.interviews_available():
+                    logger.info(
+                        "Skipping interview_agents: OASIS environment is not alive "
+                        "(simulation_id=%s)",
+                        self.simulation_id,
+                    )
+                    return (
+                        "Interview tool unavailable: the OASIS simulation environment "
+                        "is not running. Use insight_forge, panorama_search, or "
+                        "quick_search instead."
+                    )
                 interview_topic = parameters.get("interview_topic", parameters.get("query", ""))
                 max_agents = parameters.get("max_agents", 5)
                 if isinstance(max_agents, str):
@@ -1121,7 +1167,8 @@ class ReportAgent:
         """Validate whether parsed JSON is a valid tool call."""
         # Support both {"name": ..., "parameters": ...} and {"tool": ..., "params": ...} key names
         tool_name = data.get("name") or data.get("tool")
-        if tool_name and tool_name in self.VALID_TOOL_NAMES:
+        # Only accept tools that are currently available (e.g. hide interviews when env closed)
+        if tool_name and tool_name in self._available_tool_names():
             # Normalize keys to name / parameters
             if "tool" in data:
                 data["name"] = data.pop("tool")
@@ -1131,14 +1178,40 @@ class ReportAgent:
         return False
     
     def _get_tools_description(self) -> str:
-        """Generate tool description text."""
+        """Generate tool description text for currently available tools."""
         desc_parts = ["Available tools:"]
-        for name, tool in self.tools.items():
+        for name, tool in self._available_tools().items():
             params_desc = ", ".join([f"{k}: {v}" for k, v in tool["parameters"].items()])
             desc_parts.append(f"- {name}: {tool['description']}")
             if params_desc:
                 desc_parts.append(f"  Parameters: {params_desc}")
         return "\n".join(desc_parts)
+
+    def _get_tool_usage_advice(self) -> str:
+        """Usage advice lines matching currently available tools."""
+        advice = {
+            "insight_forge": (
+                "insight_forge: Deep insight analysis; automatically decomposes "
+                "questions and retrieves facts and relationships across dimensions"
+            ),
+            "panorama_search": (
+                "panorama_search: Wide-angle panoramic search; understand the full "
+                "picture, timeline, and evolution of an event"
+            ),
+            "quick_search": (
+                "quick_search: Quickly verify a specific information point"
+            ),
+            "interview_agents": (
+                "interview_agents: Interview simulated Agents to get first-person "
+                "viewpoints and real reactions from different roles"
+            ),
+        }
+        lines = [f"- {advice[name]}" for name in self._available_tools() if name in advice]
+        if "interview_agents" not in self._available_tool_names():
+            lines.append(
+                "- (interview_agents unavailable: OASIS simulation environment is not running)"
+            )
+        return "\n".join(lines)
 
     @staticmethod
     def _strip_fake_tool_results(response: str) -> str:
@@ -1297,6 +1370,7 @@ class ReportAgent:
             simulation_requirement=self.simulation_requirement,
             section_title=section.title,
             tools_description=self._get_tools_description(),
+            tool_usage_advice=self._get_tool_usage_advice(),
         )
         system_prompt = f"{system_prompt}\n\n{get_language_instruction()}"
 
@@ -1324,10 +1398,12 @@ class ReportAgent:
         # ReACT loop
         tool_calls_count = 0
         max_iterations = 5  # Max iteration rounds
-        min_tool_calls = 3  # Minimum tool call count
+        available_tools = self._available_tool_names()
+        # Keep requiring multiple retrievals, but never more than tools available
+        min_tool_calls = min(3, len(available_tools))
         conflict_retries = 0  # Consecutive conflicts where tool call and Final Answer appear together
         used_tools = set()  # Record tool names already called
-        all_tools = {"insight_forge", "panorama_search", "quick_search", "interview_agents"}
+        all_tools = set(available_tools)
 
         # Report context for InsightForge sub-question generation
         report_context = f"Section title: {section.title}\nSimulation requirement: {self.simulation_requirement}"
