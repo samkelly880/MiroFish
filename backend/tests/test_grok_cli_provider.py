@@ -38,6 +38,28 @@ def test_grok_cli_uses_prompt_file_not_argv(monkeypatch, tmp_path):
     text = provider.chat([{"role": "user", "content": "Say hello"}])
     assert text == "hello world"
     assert calls
+    cmd = calls[0][0]
+    assert cmd[cmd.index("--max-turns") + 1] == "16"
+
+
+def test_grok_cli_max_turns_env_override(monkeypatch, tmp_path):
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        return DummyCompleted(
+            stdout=json.dumps({"text": "ok", "stopReason": "end_turn"})
+        )
+
+    monkeypatch.setenv("GROK_CLI_MAX_TURNS", "8")
+    monkeypatch.setattr("app.providers.grok_cli.subprocess.run", fake_run)
+    monkeypatch.setattr("app.providers.grok_cli.grok_binary_available", lambda binary=None: True)
+
+    provider = GrokCLIProvider(binary="grok", cwd=str(tmp_path))
+    assert provider.max_turns == 8
+    provider.chat([{"role": "user", "content": "hi"}])
+    cmd = calls[0]
+    assert cmd[cmd.index("--max-turns") + 1] == "8"
 
 
 def test_grok_cli_chat_json_prefers_structured_output(monkeypatch, tmp_path):

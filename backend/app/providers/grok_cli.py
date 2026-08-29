@@ -106,7 +106,7 @@ class GrokCLIProvider:
         binary: Optional[str] = None,
         model: Optional[str] = None,
         timeout_seconds: Optional[int] = None,
-        max_turns: int = 1,
+        max_turns: Optional[int] = None,
         disallowed_tools: Optional[str] = None,
         cwd: Optional[str] = None,
     ):
@@ -117,7 +117,12 @@ class GrokCLIProvider:
         self.timeout_seconds = timeout_seconds or int(
             os.environ.get("GROK_CLI_TIMEOUT_SECONDS", "300")
         )
-        self.max_turns = max_turns
+        # ReportAgent ReACT prompts can require multiple headless turns even with
+        # coding tools disabled. Default 1 was too low and surfaced as
+        # "max turns reached" during section generation.
+        if max_turns is None:
+            max_turns = int(os.environ.get("GROK_CLI_MAX_TURNS", "16"))
+        self.max_turns = max(1, max_turns)
         self.disallowed_tools = (
             disallowed_tools
             if disallowed_tools is not None
