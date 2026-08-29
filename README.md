@@ -4,8 +4,6 @@
 
 <a href="https://trendshift.io/repositories/16144" target="_blank"><img src="https://trendshift.io/api/badge/repositories/16144" alt="666ghj%2FMiroFish | Trendshift" style="width: 250px; height: 55px;" width="250" height="55"/></a>
 
-简洁通用的群体智能引擎，预测万物
-</br>
 <em>A Simple and Universal Swarm Intelligence Engine, Predicting Anything</em>
 
 <a href="https://www.shanda.com/" target="_blank"><img src="./static/image/shanda_logo.png" alt="666ghj%2FMiroFish | Shanda" height="40"/></a>
@@ -115,15 +113,18 @@ cp .env.example .env
 **Required Environment Variables:**
 
 ```env
-# LLM API Configuration (supports any LLM API with OpenAI SDK format)
-# Recommended: Alibaba Qwen-plus model via Bailian Platform: https://bailian.console.aliyun.com/
-# High consumption, try simulations with fewer than 40 rounds first
+# LLM API Configuration (any OpenAI-compatible API)
+# Examples:
+#   OpenAI:   LLM_BASE_URL=https://api.openai.com/v1
+#   xAI/Grok: LLM_BASE_URL=https://api.x.ai/v1
+#             LLM_MODEL_NAME=grok-4
+# Simulations can be costly; try fewer than 40 rounds first
 LLM_API_KEY=your_api_key
-LLM_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
-LLM_MODEL_NAME=qwen-plus
+LLM_BASE_URL=https://api.openai.com/v1
+LLM_MODEL_NAME=gpt-4o-mini
 
 # Zep Cloud Configuration
-# Free monthly quota is sufficient for simple usage: https://app.getzep.com/
+# Free monthly quota is sufficient for light usage: https://app.getzep.com/
 ZEP_API_KEY=your_zep_api_key
 ```
 
