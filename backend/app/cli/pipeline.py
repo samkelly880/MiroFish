@@ -48,6 +48,76 @@ def _platform_flags(platform: str) -> Dict[str, bool]:
     return {"enable_twitter": True, "enable_reddit": True}
 
 
+def _wait_for_simulation_terminal(
+    *,
+    simulation_id: str,
+    progress: Optional[ProgressCallback] = None,
+    poll_seconds: float = 2.0,
+) -> None:
+    """
+    Wait until the runner reaches a terminal status.
+
+    After all enabled platforms finish their rounds, OASIS keeps the process
+    alive in IPC wait-for-commands mode (runner_status stays RUNNING). For a
+    non-interactive CLI run, send close_env once (same mechanism as the web
+    /api/simulation/close-env endpoint), then continue waiting so the monitor
+    thread can stop the Zep updater and publish COMPLETED/STOPPED/FAILED.
+    """
+    terminal = {
+        RunnerStatus.COMPLETED,
+        RunnerStatus.FAILED,
+        RunnerStatus.STOPPED,
+    }
+    close_requested = False
+
+    while True:
+        run_state = SimulationRunner.get_run_state(simulation_id)
+        status_value = run_state.runner_status if run_state else None
+        _progress(
+            progress,
+            "simulate_status",
+            simulation_id=simulation_id,
+            status=str(status_value),
+            platforms_done=(
+                SimulationRunner._check_all_platforms_completed(run_state)
+                if run_state
+                else False
+            ),
+            close_requested=close_requested,
+        )
+        if status_value in terminal:
+            if status_value == RunnerStatus.FAILED:
+                raise PipelineError(
+                    f"Simulation failed: {getattr(run_state, 'error', None) or status_value}"
+                )
+            return
+
+        if (
+            run_state is not None
+            and not close_requested
+            and status_value == RunnerStatus.RUNNING
+            and SimulationRunner._check_all_platforms_completed(run_state)
+        ):
+            _progress(
+                progress,
+                "close_env",
+                simulation_id=simulation_id,
+                reason="all_platforms_completed",
+            )
+            try:
+                SimulationRunner.close_simulation_env(simulation_id)
+            except Exception as exc:  # noqa: BLE001 - keep waiting/monitor owns terminal state
+                _progress(
+                    progress,
+                    "close_env_warning",
+                    simulation_id=simulation_id,
+                    error=str(exc),
+                )
+            close_requested = True
+
+        time.sleep(poll_seconds)
+
+
 def _copy_inputs_into_project(project_id: str, files: List[str]) -> List[str]:
     """Copy local files into the project uploads folder; return extracted texts."""
     files_dir = ProjectManager._get_project_files_dir(project_id)
@@ -214,27 +284,14 @@ def run_pipeline(
             graph_id=graph_id,
         )
 
-        terminal = {
-            RunnerStatus.COMPLETED,
-            RunnerStatus.FAILED,
-            RunnerStatus.STOPPED,
-        }
-        while True:
-            run_state = SimulationRunner.get_run_state(sim_state.simulation_id)
-            status_value = run_state.runner_status if run_state else None
-            _progress(
-                progress,
-                "simulate_status",
-                simulation_id=sim_state.simulation_id,
-                status=str(status_value),
-            )
-            if status_value in terminal:
-                if status_value == RunnerStatus.FAILED:
-                    raise PipelineError(
-                        f"Simulation failed: {getattr(run_state, 'error', None) or status_value}"
-                    )
-                break
-            time.sleep(2)
+        # Finite CLI runs: OASIS stays in wait-for-commands mode after rounds
+        # finish (same as the web backend). The web UI eventually calls
+        # /close-env; the CLI must do the equivalent so the monitor can drain
+        # Zep writes and publish COMPLETED before report generation.
+        _wait_for_simulation_terminal(
+            simulation_id=sim_state.simulation_id,
+            progress=progress,
+        )
 
         report_id = None
         report_markdown = ""
