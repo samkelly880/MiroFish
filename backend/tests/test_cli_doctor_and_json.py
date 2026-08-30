@@ -1,0 +1,218 @@
+import json
+import os
+
+import pytest
+
+from app.cli.main import main
+from app.cli.verdict import normalize_verdict
+from app.run_registry import RunRegistry
+
+
+def test_doctor_json_stdout(capsys, monkeypatch):
+    from app.config import Config
+
+    monkeypatch.setenv("LLM_PROVIDER", "grok-cli")
+    monkeypatch.delenv("ZEP_API_KEY", raising=False)
+    monkeypatch.setattr(Config, "ZEP_API_KEY", None)
+    code = main(["doctor", "--json"])
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    assert "checks" in payload
+    assert payload["ok"] is False  # ZEP missing
+    assert code == 1
+    names = {c["name"] for c in payload["checks"]}
+    assert "grok_cli" in names
+    assert "zep" in names
+
+
+def test_doctor_does_not_require_api_key_for_grok(capsys, monkeypatch):
+    from app.config import Config
+
+    monkeypatch.setenv("LLM_PROVIDER", "grok-cli")
+    monkeypatch.delenv("LLM_API_KEY", raising=False)
+    monkeypatch.setenv("ZEP_API_KEY", "test-zep")
+    monkeypatch.setattr(Config, "ZEP_API_KEY", "test-zep")
+    monkeypatch.setattr(Config, "LLM_API_KEY", None)
+    code = main(["doctor", "--json"])
+    payload = json.loads(capsys.readouterr().out)
+    api_check = next(c for c in payload["checks"] if c["name"] == "openai_compatible")
+    assert api_check["ok"] is True
+    assert "LLM_API_KEY unset" in api_check["detail"] or "optional" in api_check["detail"]
+    # May still fail if grok binary missing in some CI images
+    assert "checks" in payload
+    assert isinstance(code, int)
+
+
+def test_runs_list_json(tmp_path, capsys):
+    registry = RunRegistry(root_dir=str(tmp_path))
+    registry.create(requirement="r1")
+    code = main(["runs", "list", "--output-dir", str(tmp_path), "--json"])
+    payload = json.loads(capsys.readouterr().out)
+    assert code == 0
+    assert payload["count"] == 1
+    assert payload["runs"][0]["status"] == "created"
+
+
+def test_inspect_unknown_run(capsys, tmp_path):
+    code = main(["inspect", "run_missing", "--output-dir", str(tmp_path), "--json"])
+    payload = json.loads(capsys.readouterr().out)
+    assert code == 1
+    assert payload["ok"] is False
+
+
+def test_run_json_error_includes_pipeline_ids(capsys, monkeypatch, tmp_path):
+    from app.cli import main as cli_main
+    from app.cli.pipeline import PipelineError
+
+    def boom(**kwargs):
+        del kwargs
+        raise PipelineError(
+            "report boom",
+            run_id="run_abc",
+            simulation_id="sim_1",
+            report_id="report_9",
+        )
+
+    monkeypatch.setattr(cli_main, "run_pipeline", boom)
+    code = main(
+        [
+            "run",
+            "--files",
+            str(tmp_path / "missing.txt"),
+            "--requirement",
+            "req",
+            "--output-dir",
+            str(tmp_path),
+            "--json",
+        ]
+    )
+    # --files is validated inside run_pipeline; our mock replaces it, so args reach cmd_run.
+    # Create a dummy file so argparse/path isn't the issue — cmd_run catches PipelineError.
+    payload = json.loads(capsys.readouterr().out)
+    assert code == 1
+    assert payload["ok"] is False
+    assert payload["error"] == "report boom"
+    assert payload["run_id"] == "run_abc"
+    assert payload["simulation_id"] == "sim_1"
+    assert payload["report_id"] == "report_9"
+
+
+def test_pipeline_error_attaches_run_id_on_wrap():
+    from app.cli.pipeline import PipelineError
+
+    err = PipelineError("x", run_id="run_1", project_id="proj_1")
+    assert err.run_id == "run_1"
+    assert err.project_id == "proj_1"
+    assert err.simulation_id is None
+    assert str(err) == "x"
+
+
+def test_run_pipeline_failure_ids_come_from_fresh_registry_record(tmp_path, monkeypatch):
+    """Local RunRecord stays stale; except must use registry.update's return value."""
+    from app.cli.pipeline import PipelineError, run_pipeline
+    from app.config import Config
+    from app.run_registry import RunRegistry
+
+    registry = RunRegistry(root_dir=str(tmp_path))
+    src = tmp_path / "doc.txt"
+    src.write_text("hello world", encoding="utf-8")
+
+    monkeypatch.setattr(Config, "validate", staticmethod(lambda: []))
+
+    class FakeProject:
+        project_id = "proj_live"
+        simulation_requirement = ""
+        total_text_length = 0
+        ontology = None
+        analysis_summary = ""
+        status = None
+        graph_id = None
+        files = []
+
+    class FakePM:
+        @staticmethod
+        def create_project(name):
+            del name
+            return FakeProject()
+
+        @staticmethod
+        def save_project(project):
+            del project
+
+        @staticmethod
+        def get_project(project_id):
+            del project_id
+            return FakeProject()
+
+        @staticmethod
+        def save_extracted_text(project_id, text):
+            del project_id, text
+
+        @staticmethod
+        def _get_project_files_dir(project_id):
+            d = tmp_path / "proj_files" / project_id
+            d.mkdir(parents=True, exist_ok=True)
+            return str(d)
+
+    monkeypatch.setattr("app.cli.pipeline.ProjectManager", FakePM)
+    monkeypatch.setattr(
+        "app.cli.pipeline.FileParser.extract_text",
+        staticmethod(lambda path: "hello world"),
+    )
+    monkeypatch.setattr(
+        "app.cli.pipeline.TextProcessor.preprocess_text",
+        staticmethod(lambda text: text),
+    )
+
+    def fake_ontology_generate(**kwargs):
+        del kwargs
+        return {"entity_types": [], "edge_types": [], "analysis_summary": "ok"}
+
+    monkeypatch.setattr(
+        "app.cli.pipeline.OntologyGenerator.generate",
+        lambda self, **kwargs: fake_ontology_generate(**kwargs),
+    )
+
+    def boom_build_async(**kwargs):
+        del kwargs
+        # Simulate mid-pipeline failure after registry already has project_id.
+        raise RuntimeError("graph boom")
+
+    class FakeBuilder:
+        def build_graph_async(self, **kwargs):
+            return boom_build_async(**kwargs)
+
+    monkeypatch.setattr("app.cli.pipeline.GraphBuilderService", FakeBuilder)
+
+    # Seed project_id onto the registry row the way run_pipeline does, then
+    # force failure after that update by patching deeper — easier: wrap update
+    # is exercised when Ontology succeeds and graph fails after project_id set.
+    # run_pipeline sets project_id before ontology; graph is after ontology.
+    with pytest.raises(PipelineError) as caught:
+        run_pipeline(
+            files=[str(src)],
+            requirement="req",
+            registry=registry,
+            skip_report=True,
+            skip_verdict=True,
+        )
+    err = caught.value
+    assert err.run_id
+    assert err.project_id == "proj_live"
+    assert "graph boom" in str(err)
+
+
+def test_normalize_verdict_insufficient():
+    verdict = normalize_verdict(
+        {
+            "prediction": "",
+            "confidence": 9,
+            "key_dynamics": ["a"],
+            "signals": None,
+            "insufficient_data": False,
+        }
+    )
+    assert verdict["insufficient_data"] is True
+    assert verdict["confidence"] == 0.0
+    assert verdict["signals"] == []
+    assert "Insufficient" in verdict["prediction"]

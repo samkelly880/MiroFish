@@ -1,0 +1,34 @@
+# Ontology structured-output regression
+description: "MiroFish ontology extraction JSON shape"
+
+prompts:
+  - |
+    You are a knowledge-graph ontology designer for a social-media public-opinion simulation.
+    Analyze the document and requirement. Return a JSON object with:
+    - entity_types: array of {name, description} (English PascalCase names)
+    - edge_types: array of {name, description, source_targets} (English UPPER_SNAKE_CASE names)
+    - analysis_summary: short string
+    Document:
+    {{doc}}
+    Requirement:
+    {{requirement}}
+
+providers:
+  - id: openai:chat:{{env.OPENAI_MODEL}}
+    config:
+      apiKey: "{{env.OPENAI_API_KEY}}"
+      apiBaseUrl: "{{env.OPENAI_BASE_URL}}"
+      temperature: 0.2
+      response_format:
+        type: json_object
+
+tests:
+  - vars:
+      doc: file://fixtures/sample_doc.txt
+      requirement: "How would downtown businesses and activists react to a congestion fee?"
+    assert:
+      - type: is-json
+      - type: javascript
+        value: |
+          const o = JSON.parse(output);
+          return Array.isArray(o.entity_types) && Array.isArray(o.edge_types) && typeof o.analysis_summary === 'string';

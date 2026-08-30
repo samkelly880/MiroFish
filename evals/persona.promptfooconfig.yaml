@@ -1,0 +1,32 @@
+description: "MiroFish persona/profile JSON shape"
+
+prompts:
+  - |
+    You generate a detailed social-media user persona for an opinion simulation.
+    Return JSON with fields: name (string), bio (string), persona (string),
+    gender (male|female|other), country (string), profession (string),
+    interested_topics (string array).
+    Entity: {{entity_name}} ({{entity_type}})
+    Context: {{context}}
+
+providers:
+  - id: openai:chat:{{env.OPENAI_MODEL}}
+    config:
+      apiKey: "{{env.OPENAI_API_KEY}}"
+      apiBaseUrl: "{{env.OPENAI_BASE_URL}}"
+      temperature: 0.3
+      response_format:
+        type: json_object
+
+tests:
+  - vars:
+      entity_name: "Maya Chen"
+      entity_type: "Person"
+      context: "Transit advocate supporting a congestion fee in the city center."
+    assert:
+      - type: is-json
+      - type: javascript
+        value: |
+          const o = JSON.parse(output);
+          const okGender = ['male','female','other'].includes(String(o.gender||'').toLowerCase());
+          return typeof o.name==='string' && typeof o.bio==='string' && typeof o.persona==='string' && okGender && Array.isArray(o.interested_topics);

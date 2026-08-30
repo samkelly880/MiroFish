@@ -4,8 +4,6 @@
 
 <a href="https://trendshift.io/repositories/16144" target="_blank"><img src="https://trendshift.io/api/badge/repositories/16144" alt="666ghj%2FMiroFish | Trendshift" style="width: 250px; height: 55px;" width="250" height="55"/></a>
 
-简洁通用的群体智能引擎，预测万物
-</br>
 <em>A Simple and Universal Swarm Intelligence Engine, Predicting Anything</em>
 
 <a href="https://www.shanda.com/" target="_blank"><img src="./static/image/shanda_logo.png" alt="666ghj%2FMiroFish | Shanda" height="40"/></a>
@@ -115,15 +113,18 @@ cp .env.example .env
 **Required Environment Variables:**
 
 ```env
-# LLM API Configuration (supports any LLM API with OpenAI SDK format)
-# Recommended: Alibaba Qwen-plus model via Bailian Platform: https://bailian.console.aliyun.com/
-# High consumption, try simulations with fewer than 40 rounds first
-LLM_API_KEY=your_api_key
-LLM_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
-LLM_MODEL_NAME=qwen-plus
+# Primary LLM provider: Grok CLI (no xAI API key required after `grok login`)
+LLM_PROVIDER=grok-cli
+# Install: curl -fsSL https://x.ai/cli/install.sh | bash && grok login
 
-# Zep Cloud Configuration
-# Free monthly quota is sufficient for simple usage: https://app.getzep.com/
+# Optional secondary provider (OpenAI-compatible HTTP API):
+# LLM_PROVIDER=openai-compatible
+# LLM_API_KEY=your_api_key
+# LLM_BASE_URL=https://api.openai.com/v1
+# LLM_MODEL_NAME=gpt-4o-mini
+
+# Zep Cloud Configuration (required)
+# Free monthly quota is sufficient for light usage: https://app.getzep.com/
 ZEP_API_KEY=your_zep_api_key
 ```
 
@@ -161,6 +162,24 @@ npm run dev
 npm run backend   # Start backend only
 npm run frontend  # Start frontend only
 ```
+
+### CLI (agent-friendly)
+
+After backend deps are installed (`npm run setup:backend`):
+
+```bash
+cd backend
+uv run mirofish doctor --json
+uv run mirofish run --files ../path/to/seed.md --requirement "How would voters react?" --json
+uv run mirofish runs list --json
+uv run mirofish inspect <run_id> --json
+```
+
+- **Primary LLM:** Grok CLI (`LLM_PROVIDER=grok-cli`). Run `grok login` once — **no xAI API key required** for the normal workflow.
+- **Optional LLM:** set `LLM_PROVIDER=openai-compatible` plus `LLM_API_KEY` / `LLM_BASE_URL` / `LLM_MODEL_NAME`.
+- Run artifacts live under `backend/uploads/runs/<run_id>/` (`manifest.json`, `report/verdict.json`, …).
+
+Optional Promptfoo evals (not required at runtime): see [`evals/README.md`](./evals/README.md).
 
 ### Option 2: Docker Deployment
 

@@ -1,0 +1,12 @@
+# Default Promptfoo entrypoint — runs all MiroFish structured-output suites.
+description: "MiroFish LLM evaluation suite"
+
+# Import individual suite configs by running them separately, or extend here.
+prompts: []
+providers: []
+tests: []
+
+# Prefer per-suite configs for clarity:
+#   npx promptfoo eval -c ontology.promptfooconfig.yaml
+#   npx promptfoo eval -c persona.promptfooconfig.yaml
+#   npx promptfoo eval -c verdict.promptfooconfig.yaml
