@@ -197,17 +197,35 @@ def test_insight_reuses_when_probe_overlaps():
     assert tools._report_scope.insight_full_runs == 1
     assert tools._report_scope.canonical_insight is not None
 
-    # Section-flavored query that still retrieves the same facts
+    # Section-flavored query that still retrieves the same facts AND shares tokens
     second = tools.insight_forge(
         graph_id="graph_a",
-        query="How did downtown businesses and activists react on social media?",
+        query="How would downtown businesses react on social media?",
         simulation_requirement="How would businesses react?",
         report_context="Section: group actions",
     )
     assert tools._report_scope.insight_cache_reuses == 1
     assert tools._report_scope.insight_full_runs == 1  # no second full run
-    assert second.query.startswith("How did downtown")
+    assert second.query.startswith("How would downtown")
     assert second.semantic_facts == first.semantic_facts
+    tools.end_report_scope()
+
+
+def test_insight_full_run_when_query_diverges_even_if_facts_overlap():
+    """Small graphs often return the same edges for any query; require query affinity."""
+    tools = ScopedZepTools()
+    tools.begin_report_scope("graph_a", "How would businesses react?")
+    tools.prefetch_canonical_insight()
+    assert tools._report_scope.insight_full_runs == 1
+
+    divergent = tools.insight_forge(
+        graph_id="graph_a",
+        query="Completely unrelated zoning ordinance timeline for 2030",
+        simulation_requirement="How would businesses react?",
+    )
+    assert tools._report_scope.insight_cache_reuses == 0
+    assert tools._report_scope.insight_full_runs == 2
+    assert "zoning" in divergent.query
     tools.end_report_scope()
 
 

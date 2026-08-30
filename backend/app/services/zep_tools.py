@@ -456,12 +456,31 @@ class InterviewResult:
 # reusing a prior insight_forge result within one report. Below this threshold
 # the section query is treated as genuinely divergent and full forge runs.
 INSIGHT_FACT_OVERLAP_THRESHOLD = 0.85
+# Section queries on tiny graphs often retrieve nearly the same edges as the
+# canonical overview. Require some query affinity before skipping a full forge.
+INSIGHT_QUERY_OVERLAP_THRESHOLD = 0.2
 
 
 def _fact_jaccard(facts_a: List[str], facts_b: List[str]) -> float:
     """Jaccard similarity over fact strings (order-insensitive)."""
     a = set(facts_a or [])
     b = set(facts_b or [])
+    if not a and not b:
+        return 1.0
+    if not a or not b:
+        return 0.0
+    return len(a & b) / len(a | b)
+
+
+def _token_jaccard(text_a: str, text_b: str) -> float:
+    """Jaccard similarity over alphanumeric tokens (len > 2)."""
+    import re
+
+    def tokens(text: str) -> set:
+        return {w.lower() for w in re.findall(r"[a-zA-Z0-9]+", text or "") if len(w) > 2}
+
+    a = tokens(text_a)
+    b = tokens(text_b)
     if not a and not b:
         return 1.0
     if not a or not b:
@@ -1336,22 +1355,31 @@ class ZepToolsService:
                 limit=20,
                 scope="edges",
             )
-            overlap = _fact_jaccard(
+            fact_overlap = _fact_jaccard(
                 probe.facts,
                 scope.canonical_insight.semantic_facts,
             )
-            if overlap >= INSIGHT_FACT_OVERLAP_THRESHOLD:
+            query_overlap = _token_jaccard(query, scope.canonical_insight.query)
+            if (
+                fact_overlap >= INSIGHT_FACT_OVERLAP_THRESHOLD
+                and query_overlap >= INSIGHT_QUERY_OVERLAP_THRESHOLD
+            ):
                 scope.insight_cache_reuses += 1
                 logger.info(
-                    "Reusing canonical insight_forge (graph_id=%s, fact_overlap=%.2f)",
+                    "Reusing canonical insight_forge (graph_id=%s, "
+                    "fact_overlap=%.2f, query_overlap=%.2f)",
                     graph_id,
-                    overlap,
+                    fact_overlap,
+                    query_overlap,
                 )
                 return self._clone_insight_for_query(scope.canonical_insight, query)
             logger.info(
-                "insight_forge cache miss (fact_overlap=%.2f < %.2f); running full forge",
-                overlap,
+                "insight_forge cache miss (fact_overlap=%.2f query_overlap=%.2f; "
+                "need >=%.2f / >=%.2f); running full forge",
+                fact_overlap,
+                query_overlap,
                 INSIGHT_FACT_OVERLAP_THRESHOLD,
+                INSIGHT_QUERY_OVERLAP_THRESHOLD,
             )
         
         result = InsightForgeResult(

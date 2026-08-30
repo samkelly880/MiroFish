@@ -54,6 +54,7 @@ def _wait_for_simulation_terminal(
     progress: Optional[ProgressCallback] = None,
     poll_seconds: float = 2.0,
     timeout_seconds: float = 7200.0,
+    post_close_grace_seconds: float = 120.0,
 ) -> None:
     """
     Wait until the runner reaches a terminal status.
@@ -76,7 +77,6 @@ def _wait_for_simulation_terminal(
     close_attempts = 0
     last_close_at = 0.0
     last_close_error: Optional[str] = None
-    post_close_grace_seconds = 120.0
     deadline = time.time() + timeout_seconds
 
     while True:
@@ -142,8 +142,20 @@ def _wait_for_simulation_terminal(
                 attempt=close_attempts + 1,
             )
             try:
-                SimulationRunner.close_simulation_env(simulation_id)
-                last_close_error = None
+                result = SimulationRunner.close_simulation_env(simulation_id)
+                if isinstance(result, dict) and not result.get("success", True):
+                    last_close_error = str(
+                        result.get("message") or result.get("error") or result
+                    )
+                    _progress(
+                        progress,
+                        "close_env_warning",
+                        simulation_id=simulation_id,
+                        error=last_close_error,
+                        attempt=close_attempts + 1,
+                    )
+                else:
+                    last_close_error = None
             except Exception as exc:  # noqa: BLE001 - keep waiting/monitor owns terminal state
                 last_close_error = str(exc)
                 _progress(
