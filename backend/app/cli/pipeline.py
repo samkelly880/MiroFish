@@ -60,9 +60,12 @@ def _wait_for_simulation_terminal(
 
     After all enabled platforms finish their rounds, OASIS keeps the process
     alive in IPC wait-for-commands mode (runner_status stays RUNNING). For a
-    non-interactive CLI run, send close_env once (same mechanism as the web
-    /api/simulation/close-env endpoint), then continue waiting so the monitor
-    thread can stop the Zep updater and publish COMPLETED/STOPPED/FAILED.
+    non-interactive CLI run, send close_env (up to two attempts, spaced ≥30s)
+    via the same mechanism as the web /api/simulation/close-env endpoint, then
+    continue waiting so the monitor thread can stop the Zep updater and publish
+    COMPLETED/STOPPED/FAILED. If both close attempts leave the runner RUNNING,
+    fail after a short post-close grace period instead of burning the full
+    timeout.
     """
     terminal = {
         RunnerStatus.COMPLETED,
@@ -72,10 +75,13 @@ def _wait_for_simulation_terminal(
     close_requested = False
     close_attempts = 0
     last_close_at = 0.0
+    last_close_error: Optional[str] = None
+    post_close_grace_seconds = 120.0
     deadline = time.time() + timeout_seconds
 
     while True:
-        if time.time() >= deadline:
+        now = time.time()
+        if now >= deadline:
             run_state = SimulationRunner.get_run_state(simulation_id)
             status_value = run_state.runner_status if run_state else None
             raise PipelineError(
@@ -86,16 +92,17 @@ def _wait_for_simulation_terminal(
 
         run_state = SimulationRunner.get_run_state(simulation_id)
         status_value = run_state.runner_status if run_state else None
+        platforms_done = (
+            SimulationRunner._check_all_platforms_completed(run_state)
+            if run_state
+            else False
+        )
         _progress(
             progress,
             "simulate_status",
             simulation_id=simulation_id,
             status=str(status_value),
-            platforms_done=(
-                SimulationRunner._check_all_platforms_completed(run_state)
-                if run_state
-                else False
-            ),
+            platforms_done=platforms_done,
             close_requested=close_requested,
         )
         if status_value in terminal:
@@ -105,12 +112,26 @@ def _wait_for_simulation_terminal(
                 )
             return
 
+        if (
+            close_attempts >= 2
+            and status_value == RunnerStatus.RUNNING
+            and platforms_done
+            and last_close_at > 0
+            and (now - last_close_at) >= post_close_grace_seconds
+        ):
+            detail = last_close_error or "no exception (close may have been ignored)"
+            raise PipelineError(
+                f"Simulation {simulation_id} still RUNNING after {close_attempts} "
+                f"close_env attempts and {post_close_grace_seconds:.0f}s grace "
+                f"(last close error: {detail})"
+            )
+
         can_close = (
             run_state is not None
             and status_value == RunnerStatus.RUNNING
-            and SimulationRunner._check_all_platforms_completed(run_state)
+            and platforms_done
             and close_attempts < 2
-            and (close_attempts == 0 or (time.time() - last_close_at) >= 30.0)
+            and (close_attempts == 0 or (now - last_close_at) >= 30.0)
         )
         if can_close:
             _progress(
@@ -122,7 +143,9 @@ def _wait_for_simulation_terminal(
             )
             try:
                 SimulationRunner.close_simulation_env(simulation_id)
+                last_close_error = None
             except Exception as exc:  # noqa: BLE001 - keep waiting/monitor owns terminal state
+                last_close_error = str(exc)
                 _progress(
                     progress,
                     "close_env_warning",
