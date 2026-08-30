@@ -84,6 +84,25 @@ def test_bridge_invalid_action_falls_back_to_do_nothing():
     assert name == "DO_NOTHING"
 
 
+def test_bridge_provider_errors_are_not_swallowed_as_do_nothing():
+    class BoomLLM(FakeLLM):
+        def chat_json(self, messages, temperature=0.3, max_tokens=None, max_attempts=1, json_schema=None):
+            raise RuntimeError("provider transport failed")
+
+    bridge = OasisLLMBridge.__new__(OasisLLMBridge)
+    bridge.provider_name = "fake"
+    bridge.llm = BoomLLM({})
+    bridge.model_name = "fake"
+    tools = [
+        {"type": "function", "function": {"name": "DO_NOTHING", "parameters": {"type": "object"}}},
+    ]
+    try:
+        bridge.complete([{"role": "user", "content": "x"}], tools=tools)
+        assert False, "expected provider RuntimeError to propagate"
+    except RuntimeError as exc:
+        assert "provider transport failed" in str(exc)
+
+
 def test_build_chat_completion_tool_calls_finish_reason():
     completion = build_chat_completion(
         model="m",

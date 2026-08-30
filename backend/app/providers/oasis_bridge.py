@@ -172,7 +172,10 @@ class OasisLLMBridge:
                 json_schema=schema,
             )
             name, arguments = parse_action_payload(payload, tools)
-        except (ActionValidationError, Exception) as exc:
+        except ActionValidationError as exc:
+            # Soft-fallback only for invalid model action payloads. Provider /
+            # transport failures must propagate so a broken LLM backend does
+            # not look like a successful idle simulation.
             logger.warning(
                 "OASIS action parse failed (%s); falling back to DO_NOTHING",
                 exc,

@@ -41,3 +41,19 @@ def test_run_registry_unknown_update(tmp_path):
         assert False, "expected KeyError"
     except KeyError:
         pass
+
+
+def test_run_registry_rejects_path_escape(tmp_path):
+    registry = RunRegistry(root_dir=str(tmp_path / "runs"))
+    record = registry.create(requirement="x")
+    try:
+        registry.write_artifact(record.run_id, "../outside.txt", "nope")
+        assert False, "expected ValueError"
+    except ValueError:
+        pass
+    assert registry.get("../evil") is None
+    try:
+        registry.artifact_path(record.run_id, "/tmp/abs.txt")
+        assert False, "expected ValueError"
+    except ValueError:
+        pass

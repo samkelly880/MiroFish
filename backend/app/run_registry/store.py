@@ -9,16 +9,45 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from ..config import Config
 
+_SAFE_ID_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _validate_safe_id(value: str, *, label: str = "id") -> str:
+    if not value or not _SAFE_ID_RE.match(value):
+        raise ValueError(f"Invalid {label}: {value!r}")
+    return value
+
+
+def _safe_join_under(root: str, *parts: str) -> str:
+    """Join path parts under root; reject abs paths and .. escapes."""
+    root_resolved = Path(root).resolve()
+    cleaned: List[str] = []
+    for part in parts:
+        if not part:
+            continue
+        candidate = Path(part)
+        if candidate.is_absolute():
+            raise ValueError(f"Absolute path not allowed: {part!r}")
+        if ".." in candidate.parts:
+            raise ValueError(f"Path escape not allowed: {part!r}")
+        cleaned.append(part)
+    resolved = root_resolved.joinpath(*cleaned).resolve()
+    if resolved != root_resolved and not resolved.is_relative_to(root_resolved):
+        raise ValueError(f"Path escapes registry root: {resolved}")
+    return str(resolved)
 
 
 @dataclass
@@ -56,7 +85,8 @@ class RunRegistry:
         os.makedirs(self.root_dir, exist_ok=True)
 
     def _run_dir(self, run_id: str) -> str:
-        return os.path.join(self.root_dir, run_id)
+        safe_id = _validate_safe_id(run_id, label="run_id")
+        return _safe_join_under(self.root_dir, safe_id)
 
     def manifest_path(self, run_id: str) -> str:
         return os.path.join(self._run_dir(run_id), "manifest.json")
@@ -71,6 +101,7 @@ class RunRegistry:
         run_id: Optional[str] = None,
     ) -> RunRecord:
         run_id = run_id or f"run_{uuid.uuid4().hex[:12]}"
+        _validate_safe_id(run_id, label="run_id")
         record = RunRecord(
             run_id=run_id,
             requirement=requirement,
@@ -90,7 +121,10 @@ class RunRegistry:
             json.dump(record.to_dict(), handle, ensure_ascii=False, indent=2)
 
     def get(self, run_id: str) -> Optional[RunRecord]:
-        path = self.manifest_path(run_id)
+        try:
+            path = self.manifest_path(run_id)
+        except ValueError:
+            return None
         if not os.path.isfile(path):
             return None
         with open(path, "r", encoding="utf-8") as handle:
@@ -122,8 +156,10 @@ class RunRegistry:
         return records[:limit]
 
     def artifact_path(self, run_id: str, *parts: str) -> str:
-        path = os.path.join(self._run_dir(run_id), *parts)
-        os.makedirs(os.path.dirname(path), exist_ok=True)
+        path = _safe_join_under(self._run_dir(run_id), *parts)
+        parent = os.path.dirname(path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
         return path
 
     def write_artifact(self, run_id: str, relative_path: str, content: str) -> str:

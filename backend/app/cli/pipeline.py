@@ -53,6 +53,7 @@ def _wait_for_simulation_terminal(
     simulation_id: str,
     progress: Optional[ProgressCallback] = None,
     poll_seconds: float = 2.0,
+    timeout_seconds: float = 7200.0,
 ) -> None:
     """
     Wait until the runner reaches a terminal status.
@@ -69,8 +70,20 @@ def _wait_for_simulation_terminal(
         RunnerStatus.STOPPED,
     }
     close_requested = False
+    close_attempts = 0
+    last_close_at = 0.0
+    deadline = time.time() + timeout_seconds
 
     while True:
+        if time.time() >= deadline:
+            run_state = SimulationRunner.get_run_state(simulation_id)
+            status_value = run_state.runner_status if run_state else None
+            raise PipelineError(
+                f"Timed out waiting for simulation {simulation_id} after "
+                f"{timeout_seconds:.0f}s (last status={status_value}, "
+                f"close_requested={close_requested})"
+            )
+
         run_state = SimulationRunner.get_run_state(simulation_id)
         status_value = run_state.runner_status if run_state else None
         _progress(
@@ -92,17 +105,20 @@ def _wait_for_simulation_terminal(
                 )
             return
 
-        if (
+        can_close = (
             run_state is not None
-            and not close_requested
             and status_value == RunnerStatus.RUNNING
             and SimulationRunner._check_all_platforms_completed(run_state)
-        ):
+            and close_attempts < 2
+            and (close_attempts == 0 or (time.time() - last_close_at) >= 30.0)
+        )
+        if can_close:
             _progress(
                 progress,
                 "close_env",
                 simulation_id=simulation_id,
                 reason="all_platforms_completed",
+                attempt=close_attempts + 1,
             )
             try:
                 SimulationRunner.close_simulation_env(simulation_id)
@@ -112,8 +128,11 @@ def _wait_for_simulation_terminal(
                     "close_env_warning",
                     simulation_id=simulation_id,
                     error=str(exc),
+                    attempt=close_attempts + 1,
                 )
             close_requested = True
+            close_attempts += 1
+            last_close_at = time.time()
 
         time.sleep(poll_seconds)
 

@@ -734,9 +734,19 @@ class ZepToolsService:
     def format_panorama_observation(self, result: PanoramaResult) -> str:
         """Full or compact panorama text for ReACT observations."""
         scope = getattr(self, "_report_scope", None)
-        if scope is not None and scope.shared_evidence_text:
-            scope.compact_panorama_observations += 1
-            return result.to_compact_text()
+        if (
+            scope is not None
+            and scope.shared_evidence_text
+            and scope.canonical_insight is not None
+            and scope.canonical_insight.semantic_facts
+        ):
+            overlap = _fact_jaccard(
+                list(result.active_facts or []),
+                list(scope.canonical_insight.semantic_facts),
+            )
+            if overlap >= INSIGHT_FACT_OVERLAP_THRESHOLD:
+                scope.compact_panorama_observations += 1
+                return result.to_compact_text()
         return result.to_text()
     
     def _call_with_retry(self, func, operation_name: str, max_retries: int = None):

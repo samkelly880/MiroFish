@@ -8,9 +8,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from pathlib import Path
 from typing import Any, Dict, Optional
+
+_SAFE_ID_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 
 
 def _repo_root() -> Path:
@@ -20,6 +23,21 @@ def _repo_root() -> Path:
 
 def _uploads(root: Path) -> Path:
     return root / "backend" / "uploads"
+
+
+def _safe_id(value: str, *, label: str) -> str:
+    if not value or not _SAFE_ID_RE.match(value):
+        raise SystemExit(f"Invalid {label}: {value!r}")
+    return value
+
+
+def _safe_child(parent: Path, name: str) -> Path:
+    _safe_id(name, label="path id")
+    resolved = (parent / name).resolve()
+    parent_resolved = parent.resolve()
+    if not resolved.is_relative_to(parent_resolved):
+        raise SystemExit(f"Path escapes uploads root: {resolved}")
+    return resolved
 
 
 def _load_json(path: Path) -> Optional[Dict[str, Any]]:
@@ -36,7 +54,8 @@ def resolve_ids(
 ) -> Dict[str, Optional[str]]:
     uploads = _uploads(root)
     if run_id:
-        manifest = _load_json(uploads / "runs" / run_id / "manifest.json")
+        run_id = _safe_id(run_id, label="run_id")
+        manifest = _load_json(_safe_child(uploads / "runs", run_id) / "manifest.json")
         if not manifest:
             raise SystemExit(f"Unknown run_id: {run_id}")
         return {
@@ -48,7 +67,10 @@ def resolve_ids(
             "manifest": manifest,
         }
     if report_id:
-        meta = _load_json(uploads / "reports" / report_id / "meta.json")
+        report_id = _safe_id(report_id, label="report_id")
+        meta = _load_json(
+            _safe_child(uploads / "reports", report_id) / "meta.json"
+        )
         if not meta:
             raise SystemExit(f"Unknown report_id: {report_id}")
         return {
@@ -89,7 +111,8 @@ def extract(root: Path, run_id: Optional[str], report_id: Optional[str]) -> Dict
             out["verdict"] = verdict
 
     if rid:
-        rdir = uploads / "reports" / rid
+        rid = _safe_id(str(rid), label="report_id")
+        rdir = _safe_child(uploads / "reports", rid)
         progress = _load_json(rdir / "progress.json")
         outline = _load_json(rdir / "outline.json")
         meta = _load_json(rdir / "meta.json")
@@ -103,8 +126,8 @@ def extract(root: Path, run_id: Optional[str], report_id: Optional[str]) -> Dict
             out["report_error"] = meta.get("error")
         # Prefer run verdict; else try run artifact path if present
         if "verdict" not in out and ids.get("run_id"):
-            vpath = uploads / "runs" / ids["run_id"] / "report" / "verdict.json"
-            verdict = _load_json(vpath)
+            run_dir = _safe_child(uploads / "runs", str(ids["run_id"]))
+            verdict = _load_json(run_dir / "report" / "verdict.json")
             if verdict:
                 out["verdict"] = verdict
         sections = []
