@@ -770,7 +770,7 @@ When you have obtained enough information via tools, output the section content 
 7. [Emphasize Again] Do not add any headings! Use **bold** instead of subsection titles"""
 
 SECTION_USER_PROMPT_TEMPLATE = """\
-Completed section content (read carefully to avoid repetition):
+Completed section digests (for anti-repetition and coherence; do not restate these claims, quotes, or topics):
 {previous_content}
 
 ═══════════════════════════════════════════════════════════════
@@ -778,7 +778,7 @@ Completed section content (read carefully to avoid repetition):
 ═══════════════════════════════════════════════════════════════
 
 [Important Reminders]
-1. Carefully read the completed sections above and avoid repeating the same content!
+1. Carefully read the completed section digests above and avoid repeating the same content!
 2. You must call tools to obtain simulation data before starting
 3. Mix different tools; do not use only one
 4. Report content must come from retrieval results; do not use your own knowledge
@@ -1018,7 +1018,8 @@ class ReportAgent:
                     simulation_requirement=self.simulation_requirement,
                     report_context=ctx
                 )
-                return result.to_text()
+                # Compact when evidence already lives in Shared Report Evidence
+                return self.zep_tools.format_insight_observation(result)
             
             elif tool_name == "panorama_search":
                 # Breadth search - get full overview
@@ -1031,10 +1032,10 @@ class ReportAgent:
                     query=query,
                     include_expired=include_expired
                 )
-                return result.to_text()
+                return self.zep_tools.format_panorama_observation(result)
             
             elif tool_name == "quick_search":
-                # Simple search - fast retrieval
+                # Simple search - fast retrieval (always full; section-specific)
                 query = parameters.get("query", "")
                 limit = parameters.get("limit", 10)
                 if isinstance(limit, str):
@@ -1330,6 +1331,108 @@ class ReportAgent:
                 ]
             )
     
+    # Budgets for previous-section digests in later section prompts (Opt4).
+    PREV_SECTION_DIGEST_LATEST_CHARS = 1600
+    PREV_SECTION_DIGEST_OLDER_CHARS = 900
+    PREV_SECTION_DIGEST_MAX_QUOTES = 6
+    PREV_SECTION_DIGEST_MAX_TOPICS = 8
+
+    @staticmethod
+    def _digest_previous_section(section_text: str, max_chars: int = 1200) -> str:
+        """
+        Build a compact anti-repetition digest of a completed section.
+
+        Preserves title, opening claims, bold topic markers, and key quotes
+        without an extra LLM call. Does not delete prior sections — compresses them.
+        """
+        if not section_text:
+            return ""
+        text = section_text.strip()
+        if len(text) <= max_chars:
+            return text
+
+        lines = text.splitlines()
+        title = ""
+        body_start = 0
+        if lines and lines[0].startswith("#"):
+            title = lines[0].strip()
+            body_start = 1
+
+        topics: List[str] = []
+        quotes: List[str] = []
+        opening_chunks: List[str] = []
+        bullets: List[str] = []
+
+        bold_re = re.compile(r"\*\*([^*]+)\*\*")
+        for raw in lines[body_start:]:
+            line = raw.strip()
+            if not line:
+                continue
+            if line.startswith(">"):
+                q = line.lstrip(">").strip().strip('"').strip("'")
+                if q and len(quotes) < ReportAgent.PREV_SECTION_DIGEST_MAX_QUOTES:
+                    if len(q) > 180:
+                        q = q[:177] + "..."
+                    quotes.append(q)
+                continue
+            if line.startswith(("- ", "* ", "• ")):
+                if len(bullets) < 6:
+                    bullets.append(line)
+                continue
+            for m in bold_re.finditer(line):
+                topic = m.group(1).strip()
+                if topic and topic not in topics and len(topics) < ReportAgent.PREV_SECTION_DIGEST_MAX_TOPICS:
+                    topics.append(topic)
+            # Opening prose: collect early non-structural paragraphs
+            if (
+                len(opening_chunks) < 3
+                and not line.startswith("#")
+                and not line.startswith(">")
+            ):
+                opening_chunks.append(line)
+
+        parts: List[str] = []
+        if title:
+            parts.append(title)
+        if opening_chunks:
+            opening = " ".join(opening_chunks)
+            if len(opening) > 450:
+                opening = opening[:447] + "..."
+            parts.append(opening)
+        if topics:
+            parts.append("Topics covered: " + "; ".join(topics))
+        if quotes:
+            parts.append("Key quotes already used:")
+            for q in quotes:
+                parts.append(f'> "{q}"')
+        if bullets:
+            parts.append("Points already made:")
+            parts.extend(bullets)
+
+        digest = "\n".join(parts).strip()
+        if len(digest) > max_chars:
+            digest = digest[: max_chars - 3].rstrip() + "..."
+        if not digest:
+            # Fallback: head truncation
+            digest = text[: max_chars - 3] + "..."
+        return digest
+
+    @classmethod
+    def _format_previous_sections_context(cls, previous_sections: List[str]) -> str:
+        """Format prior sections for the next section prompt (digested, not deleted)."""
+        if not previous_sections:
+            return "(This is the first section)"
+        parts = []
+        n = len(previous_sections)
+        for i, sec in enumerate(previous_sections):
+            budget = (
+                cls.PREV_SECTION_DIGEST_LATEST_CHARS
+                if i == n - 1
+                else cls.PREV_SECTION_DIGEST_OLDER_CHARS
+            )
+            parts.append(cls._digest_previous_section(sec, max_chars=budget))
+        return "\n\n---\n\n".join(parts)
+
     def _generate_section_react(
         self, 
         section: ReportSection,
@@ -1374,16 +1477,12 @@ class ReportAgent:
         )
         system_prompt = f"{system_prompt}\n\n{get_language_instruction()}"
 
-        # Build user prompt - max 4000 chars per completed section
-        if previous_sections:
-            previous_parts = []
-            for sec in previous_sections:
-                # Max 4000 chars per section
-                truncated = sec[:4000] + "..." if len(sec) > 4000 else sec
-                previous_parts.append(truncated)
-            previous_content = "\n\n---\n\n".join(previous_parts)
-        else:
-            previous_content = "(This is the first section)"
+        # Inject once-per-report shared evidence so tool observations can stay compact
+        shared_evidence = self.zep_tools.get_shared_evidence_text()
+        if shared_evidence:
+            system_prompt = f"{system_prompt}\n\n{shared_evidence}"
+
+        previous_content = self._format_previous_sections_context(previous_sections)
         
         user_prompt = SECTION_USER_PROMPT_TEMPLATE.format(
             previous_content=previous_content,
@@ -1693,6 +1792,14 @@ class ReportAgent:
         
         # Completed section titles (for progress tracking)
         completed_section_titles = []
+
+        # Report-scoped Zep retrieval cache (nodes/edges/node details/insight).
+        # Safe after finite CLI close_env + Zep drain: graph is immutable for
+        # the life of this generate_report call.
+        self.zep_tools.begin_report_scope(
+            self.graph_id,
+            self.simulation_requirement,
+        )
         
         try:
             # Initialize: create report folder and save initial state
@@ -1746,6 +1853,12 @@ class ReportAgent:
             ReportManager.save_report(report)
             
             logger.info(t('report.outlineSavedToFile', reportId=report_id))
+
+            # Prefetch one canonical insight_forge so overlapping section
+            # queries reuse evidence instead of repeating nested Grok + Zep.
+            self.zep_tools.prefetch_canonical_insight()
+            # Build compact shared evidence pack for section prompts (Opt2).
+            self.zep_tools.build_shared_evidence_text()
             
             # Stage 2: generate section by section (save per section)
             report.status = ReportStatus.GENERATING
@@ -1882,6 +1995,8 @@ class ReportAgent:
                 self.console_logger = None
             
             return report
+        finally:
+            self.zep_tools.end_report_scope()
     
     def chat(
         self, 

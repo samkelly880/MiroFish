@@ -159,6 +159,8 @@ class InsightForgeResult:
     total_facts: int = 0
     total_entities: int = 0
     total_relationships: int = 0
+    # True when this result was served from the report-scoped canonical forge
+    reused_from_canonical: bool = False
     
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -170,7 +172,8 @@ class InsightForgeResult:
             "relationship_chains": self.relationship_chains,
             "total_facts": self.total_facts,
             "total_entities": self.total_entities,
-            "total_relationships": self.total_relationships
+            "total_relationships": self.total_relationships,
+            "reused_from_canonical": self.reused_from_canonical,
         }
     
     def to_text(self) -> str:
@@ -213,6 +216,29 @@ class InsightForgeResult:
             for chain in self.relationship_chains:
                 text_parts.append(f"- {chain}")
         
+        return "\n".join(text_parts)
+
+    def to_compact_text(self, sample_facts: int = 8) -> str:
+        """
+        Compact observation when full evidence is already in Shared Report Evidence.
+        Keeps the section query label plus a short sample for grounding.
+        """
+        text_parts = [
+            "## Future Prediction Deep Analysis (compact; see Shared Report Evidence)",
+            f"Analysis question: {self.query}",
+            (
+                f"Stats: {self.total_facts} facts, {self.total_entities} entities, "
+                f"{self.total_relationships} relationship chains."
+            ),
+            (
+                "Full fact list, entity summaries, and relationship chains are in the "
+                "Shared Report Evidence block above. Quote those originals; do not invent facts."
+            ),
+        ]
+        if self.semantic_facts:
+            text_parts.append("\n### Sample key facts for this query")
+            for i, fact in enumerate(self.semantic_facts[:sample_facts], 1):
+                text_parts.append(f"{i}. \"{fact}\"")
         return "\n".join(text_parts)
 
 
@@ -283,6 +309,29 @@ class PanoramaResult:
                 entity_type = next((l for l in node.labels if l not in ["Entity", "Node"]), "Entity")
                 text_parts.append(f"- **{node.name}** ({entity_type})")
         
+        return "\n".join(text_parts)
+
+    def to_compact_text(self, max_facts: int = 12) -> str:
+        """
+        Compact panorama observation when the graph snapshot is already in
+        Shared Report Evidence. Keeps query-specific ranking; drops entity dump.
+        """
+        text_parts = [
+            "## Breadth Search (compact; see Shared Report Evidence)",
+            f"Query: {self.query}",
+            (
+                f"{self.active_count} active / {self.historical_count} historical "
+                f"(entities + full history in Shared Report Evidence)."
+            ),
+        ]
+        if self.active_facts:
+            text_parts.append("### Top active facts for this query")
+            for i, fact in enumerate(self.active_facts[:max_facts], 1):
+                text_parts.append(f"{i}. \"{fact}\"")
+        if self.historical_facts:
+            text_parts.append("### Top historical facts for this query")
+            for i, fact in enumerate(self.historical_facts[: max_facts // 2], 1):
+                text_parts.append(f"{i}. \"{fact}\"")
         return "\n".join(text_parts)
 
 
@@ -403,6 +452,58 @@ class InterviewResult:
         return "\n".join(text_parts)
 
 
+# Minimum Jaccard overlap of probe facts vs canonical insight facts before
+# reusing a prior insight_forge result within one report. Below this threshold
+# the section query is treated as genuinely divergent and full forge runs.
+INSIGHT_FACT_OVERLAP_THRESHOLD = 0.85
+
+
+def _fact_jaccard(facts_a: List[str], facts_b: List[str]) -> float:
+    """Jaccard similarity over fact strings (order-insensitive)."""
+    a = set(facts_a or [])
+    b = set(facts_b or [])
+    if not a and not b:
+        return 1.0
+    if not a or not b:
+        return 0.0
+    return len(a & b) / len(a | b)
+
+
+@dataclass
+class ReportRetrievalScope:
+    """
+    Report-scoped retrieval cache for one generate_report / one graph_id.
+
+    Valid only while ZepToolsService.begin_report_scope() is active. The finite
+    CLI path freezes the graph after close_env + Zep drain, so node/edge
+    snapshots and node details are safe to reuse for the life of one report.
+    """
+
+    graph_id: str
+    simulation_requirement: str = ""
+    nodes: Optional[List[NodeInfo]] = None
+    edges: Optional[List[EdgeInfo]] = None
+    node_details: Dict[str, Optional[NodeInfo]] = field(default_factory=dict)
+    canonical_insight: Optional[InsightForgeResult] = None
+    # Compact evidence pack injected once into each section prompt (Opt2)
+    shared_evidence_text: Optional[str] = None
+    # Exact/normalized quick_search cache: (normalized_query, limit) -> SearchResult
+    quick_search_cache: Dict[tuple, SearchResult] = field(default_factory=dict)
+    # Counters for tests / timing evidence (network = uncached Zep reads)
+    nodes_network_fetches: int = 0
+    nodes_cache_hits: int = 0
+    edges_network_fetches: int = 0
+    edges_cache_hits: int = 0
+    node_detail_network_fetches: int = 0
+    node_detail_cache_hits: int = 0
+    insight_full_runs: int = 0
+    insight_cache_reuses: int = 0
+    compact_insight_observations: int = 0
+    compact_panorama_observations: int = 0
+    quick_search_cache_hits: int = 0
+    quick_search_network_fetches: int = 0
+
+
 class ZepToolsService:
     """
     Zep retrieval tools service.
@@ -435,6 +536,8 @@ class ZepToolsService:
         self.client = get_zep_client(self.api_key)
         # LLM client used by InsightForge to generate sub-questions
         self._llm_client = llm_client
+        # Optional report-scoped cache (None outside generate_report)
+        self._report_scope: Optional[ReportRetrievalScope] = None
         logger.info(t("console.zepToolsInitialized"))
     
     @property
@@ -443,6 +546,198 @@ class ZepToolsService:
         if self._llm_client is None:
             self._llm_client = LLMClient()
         return self._llm_client
+
+    def begin_report_scope(
+        self,
+        graph_id: str,
+        simulation_requirement: str = "",
+    ) -> ReportRetrievalScope:
+        """Start a report-scoped retrieval cache for this graph (one report)."""
+        self._report_scope = ReportRetrievalScope(
+            graph_id=graph_id,
+            simulation_requirement=simulation_requirement or "",
+        )
+        logger.info(
+            "Report retrieval scope started (graph_id=%s)",
+            graph_id,
+        )
+        return self._report_scope
+
+    def end_report_scope(self) -> None:
+        """Clear the report-scoped retrieval cache (no cross-report leakage)."""
+        scope = getattr(self, "_report_scope", None)
+        if scope is not None:
+            logger.info(
+                "Report retrieval scope ended (graph_id=%s, "
+                "nodes_hits=%s nodes_fetches=%s edges_hits=%s edges_fetches=%s "
+                "node_detail_hits=%s node_detail_fetches=%s "
+                "insight_full=%s insight_reuse=%s "
+                "compact_insight_obs=%s compact_panorama_obs=%s "
+                "quick_hits=%s quick_fetches=%s)",
+                scope.graph_id,
+                scope.nodes_cache_hits,
+                scope.nodes_network_fetches,
+                scope.edges_cache_hits,
+                scope.edges_network_fetches,
+                scope.node_detail_cache_hits,
+                scope.node_detail_network_fetches,
+                scope.insight_full_runs,
+                scope.insight_cache_reuses,
+                scope.compact_insight_observations,
+                scope.compact_panorama_observations,
+                scope.quick_search_cache_hits,
+                scope.quick_search_network_fetches,
+            )
+        self._report_scope = None
+
+    def prefetch_canonical_insight(self) -> Optional[InsightForgeResult]:
+        """
+        Run insight_forge once for the simulation requirement so later section
+        calls with substantially equivalent evidence can reuse it.
+        """
+        scope = getattr(self, "_report_scope", None)
+        if scope is None:
+            return None
+        if scope.canonical_insight is not None:
+            return scope.canonical_insight
+        query = (scope.simulation_requirement or "").strip() or "simulation overview"
+        return self.insight_forge(
+            graph_id=scope.graph_id,
+            query=query,
+            simulation_requirement=scope.simulation_requirement,
+            report_context="Canonical shared report retrieval context",
+        )
+
+    @staticmethod
+    def _clone_insight_for_query(
+        canonical: InsightForgeResult,
+        query: str,
+    ) -> InsightForgeResult:
+        """Return evidence from canonical insight labeled with the section query."""
+        return InsightForgeResult(
+            query=query,
+            simulation_requirement=canonical.simulation_requirement,
+            sub_queries=list(canonical.sub_queries),
+            semantic_facts=list(canonical.semantic_facts),
+            entity_insights=[dict(e) for e in canonical.entity_insights],
+            relationship_chains=list(canonical.relationship_chains),
+            total_facts=canonical.total_facts,
+            total_entities=canonical.total_entities,
+            total_relationships=canonical.total_relationships,
+            reused_from_canonical=True,
+        )
+
+    def build_shared_evidence_text(
+        self,
+        max_facts: int = 20,
+        max_entities: int = 20,
+        max_chains: int = 15,
+    ) -> str:
+        """
+        Build a once-per-report evidence pack for section prompts.
+
+        Includes canonical insight facts (when present) plus graph entity names
+        and a bounded slice of active/historical edge facts. Safe to inject into
+        every section without re-pasting full tool dumps.
+        """
+        scope = getattr(self, "_report_scope", None)
+        if scope is None:
+            return ""
+        if scope.shared_evidence_text is not None:
+            return scope.shared_evidence_text
+
+        # Ensure snapshot is loaded for entity/edge summaries
+        nodes = self.get_all_nodes(scope.graph_id)
+        edges = self.get_all_edges(scope.graph_id, include_temporal=True)
+
+        parts = [
+            "═══════════════════════════════════════════════════════════════",
+            "[Shared Report Evidence]",
+            "Retrieved once for this report. Quote these originals in every section.",
+            "Section tool calls may return compact references to this pack.",
+            "═══════════════════════════════════════════════════════════════",
+            f"Graph: {len(nodes)} nodes, {len(edges)} edges.",
+        ]
+
+        insight = scope.canonical_insight
+        if insight and insight.semantic_facts:
+            parts.append(
+                f"\n### Canonical insight facts ({min(len(insight.semantic_facts), max_facts)} of {len(insight.semantic_facts)})"
+            )
+            for i, fact in enumerate(insight.semantic_facts[:max_facts], 1):
+                parts.append(f"{i}. \"{fact}\"")
+            if insight.entity_insights:
+                parts.append("\n### Entities")
+                for entity in insight.entity_insights[:max_entities]:
+                    name = entity.get("name", "Unknown")
+                    etype = entity.get("type", "Entity")
+                    summary = entity.get("summary") or ""
+                    line = f"- **{name}** ({etype})"
+                    if summary:
+                        line += f": {summary[:200]}"
+                    parts.append(line)
+            if insight.relationship_chains:
+                parts.append("\n### Relationship chains")
+                for chain in insight.relationship_chains[:max_chains]:
+                    parts.append(f"- {chain}")
+        else:
+            # Fallback: derive facts from edges when insight was not prefetched
+            active = [e.fact for e in edges if e.fact and not (e.is_expired or e.is_invalid)]
+            historical = []
+            for e in edges:
+                if e.fact and (e.is_expired or e.is_invalid):
+                    historical.append(e.fact)
+            parts.append(f"\n### Active facts ({min(len(active), max_facts)} of {len(active)})")
+            for i, fact in enumerate(active[:max_facts], 1):
+                parts.append(f"{i}. \"{fact}\"")
+            if historical:
+                parts.append(
+                    f"\n### Historical/expired facts ({min(len(historical), max_facts // 2)} of {len(historical)})"
+                )
+                for i, fact in enumerate(historical[: max_facts // 2], 1):
+                    parts.append(f"{i}. \"{fact}\"")
+            if nodes:
+                parts.append("\n### Entities")
+                for node in nodes[:max_entities]:
+                    etype = next(
+                        (l for l in node.labels if l not in ("Entity", "Node")),
+                        "Entity",
+                    )
+                    parts.append(f"- **{node.name}** ({etype})")
+
+        text = "\n".join(parts)
+        scope.shared_evidence_text = text
+        logger.info(
+            "Built shared report evidence text (%s chars, graph_id=%s)",
+            len(text),
+            scope.graph_id,
+        )
+        return text
+
+    def get_shared_evidence_text(self) -> str:
+        """Return the built shared evidence pack, or empty if no report scope."""
+        scope = getattr(self, "_report_scope", None)
+        if scope is None:
+            return ""
+        if scope.shared_evidence_text is None:
+            return self.build_shared_evidence_text()
+        return scope.shared_evidence_text
+
+    def format_insight_observation(self, result: InsightForgeResult) -> str:
+        """Full or compact insight text for ReACT observations."""
+        scope = getattr(self, "_report_scope", None)
+        if result.reused_from_canonical and scope is not None and scope.shared_evidence_text:
+            scope.compact_insight_observations += 1
+            return result.to_compact_text()
+        return result.to_text()
+
+    def format_panorama_observation(self, result: PanoramaResult) -> str:
+        """Full or compact panorama text for ReACT observations."""
+        scope = getattr(self, "_report_scope", None)
+        if scope is not None and scope.shared_evidence_text:
+            scope.compact_panorama_observations += 1
+            return result.to_compact_text()
+        return result.to_text()
     
     def _call_with_retry(self, func, operation_name: str, max_retries: int = None):
         """Retry one safe read using typed Zep/HTTPX error classification."""
@@ -653,6 +948,16 @@ class ZepToolsService:
         Returns:
             List of nodes
         """
+        scope = getattr(self, "_report_scope", None)
+        if scope is not None and scope.graph_id == graph_id and scope.nodes is not None:
+            scope.nodes_cache_hits += 1
+            logger.info(
+                "Report scope cache hit: all nodes (graph_id=%s, count=%s)",
+                graph_id,
+                len(scope.nodes),
+            )
+            return list(scope.nodes)
+
         logger.info(t("console.fetchingAllNodes", graphId=graph_id))
 
         nodes = fetch_all_nodes(self.client, graph_id)
@@ -669,6 +974,12 @@ class ZepToolsService:
             ))
 
         logger.info(t("console.fetchedNodes", count=len(result)))
+        if scope is not None and scope.graph_id == graph_id:
+            scope.nodes = list(result)
+            scope.nodes_network_fetches += 1
+            for node in result:
+                if node.uuid and node.uuid not in scope.node_details:
+                    scope.node_details[node.uuid] = node
         return result
 
     def get_all_edges(self, graph_id: str, include_temporal: bool = True) -> List[EdgeInfo]:
@@ -682,6 +993,17 @@ class ZepToolsService:
         Returns:
             List of edges (includes created_at, valid_at, invalid_at, expired_at)
         """
+        scope = getattr(self, "_report_scope", None)
+        # Snapshot always stores temporal fields; safe to reuse for any include_temporal.
+        if scope is not None and scope.graph_id == graph_id and scope.edges is not None:
+            scope.edges_cache_hits += 1
+            logger.info(
+                "Report scope cache hit: all edges (graph_id=%s, count=%s)",
+                graph_id,
+                len(scope.edges),
+            )
+            return list(scope.edges)
+
         logger.info(t("console.fetchingAllEdges", graphId=graph_id))
 
         edges = fetch_all_edges(self.client, graph_id)
@@ -697,8 +1019,8 @@ class ZepToolsService:
                 target_node_uuid=edge.target_node_uuid or ""
             )
 
-            # Add temporal information
-            if include_temporal:
+            # Always capture temporal fields in the report snapshot.
+            if include_temporal or (scope is not None and scope.graph_id == graph_id):
                 edge_info.created_at = getattr(edge, 'created_at', None)
                 edge_info.valid_at = getattr(edge, 'valid_at', None)
                 edge_info.invalid_at = getattr(edge, 'invalid_at', None)
@@ -707,6 +1029,9 @@ class ZepToolsService:
             result.append(edge_info)
 
         logger.info(t("console.fetchedEdges", count=len(result)))
+        if scope is not None and scope.graph_id == graph_id:
+            scope.edges = list(result)
+            scope.edges_network_fetches += 1
         return result
     
     def get_node_detail(self, node_uuid: str) -> Optional[NodeInfo]:
@@ -719,6 +1044,15 @@ class ZepToolsService:
         Returns:
             Node info or None
         """
+        scope = getattr(self, "_report_scope", None)
+        if scope is not None and node_uuid in scope.node_details:
+            scope.node_detail_cache_hits += 1
+            logger.info(
+                "Report scope cache hit: node detail (%s...)",
+                node_uuid[:8],
+            )
+            return scope.node_details[node_uuid]
+
         logger.info(t("console.fetchingNodeDetail", uuid=node_uuid[:8]))
         
         try:
@@ -728,16 +1062,23 @@ class ZepToolsService:
             )
             
             if not node:
-                return None
-            
-            return NodeInfo(
-                uuid=getattr(node, 'uuid_', None) or getattr(node, 'uuid', ''),
-                name=node.name or "",
-                labels=node.labels or [],
-                summary=node.summary or "",
-                attributes=node.attributes or {}
-            )
+                result = None
+            else:
+                result = NodeInfo(
+                    uuid=getattr(node, 'uuid_', None) or getattr(node, 'uuid', ''),
+                    name=node.name or "",
+                    labels=node.labels or [],
+                    summary=node.summary or "",
+                    attributes=node.attributes or {}
+                )
+            if scope is not None:
+                scope.node_detail_network_fetches += 1
+                scope.node_details[node_uuid] = result
+            return result
         except NotFoundError:
+            if scope is not None:
+                scope.node_detail_network_fetches += 1
+                scope.node_details[node_uuid] = None
             return None
         except Exception as e:
             logger.error(t("console.fetchNodeDetailFailed", error=str(e)))
@@ -969,6 +1310,39 @@ class ZepToolsService:
             InsightForgeResult: Deep insight retrieval result
         """
         logger.info(t("console.insightForgeStart", query=query[:50]))
+
+        # Report-scope reuse: if a prior forge for this graph produced
+        # substantially the same evidence, skip nested LLM + fan-out.
+        scope = getattr(self, "_report_scope", None)
+        if (
+            scope is not None
+            and scope.graph_id == graph_id
+            and scope.canonical_insight is not None
+            and scope.canonical_insight.semantic_facts
+        ):
+            probe = self.search_graph(
+                graph_id=graph_id,
+                query=query,
+                limit=20,
+                scope="edges",
+            )
+            overlap = _fact_jaccard(
+                probe.facts,
+                scope.canonical_insight.semantic_facts,
+            )
+            if overlap >= INSIGHT_FACT_OVERLAP_THRESHOLD:
+                scope.insight_cache_reuses += 1
+                logger.info(
+                    "Reusing canonical insight_forge (graph_id=%s, fact_overlap=%.2f)",
+                    graph_id,
+                    overlap,
+                )
+                return self._clone_insight_for_query(scope.canonical_insight, query)
+            logger.info(
+                "insight_forge cache miss (fact_overlap=%.2f < %.2f); running full forge",
+                overlap,
+                INSIGHT_FACT_OVERLAP_THRESHOLD,
+            )
         
         result = InsightForgeResult(
             query=query,
@@ -1085,6 +1459,10 @@ class ZepToolsService:
         result.total_relationships = len(relationship_chains)
         
         logger.info(t("console.insightForgeComplete", facts=result.total_facts, entities=result.total_entities, relationships=result.total_relationships))
+        if scope is not None and scope.graph_id == graph_id:
+            scope.insight_full_runs += 1
+            if scope.canonical_insight is None:
+                scope.canonical_insight = result
         return result
     
     def _generate_sub_queries(
@@ -1245,6 +1623,9 @@ Return a JSON list of sub-questions."""
         1. Directly call Zep semantic search
         2. Return the most relevant results
         3. Suited for simple, direct retrieval needs
+
+        Within an active report scope, identical (normalized query, limit)
+        pairs for the same graph_id reuse the prior SearchResult.
         
         Args:
             graph_id: Graph ID
@@ -1255,6 +1636,26 @@ Return a JSON list of sub-questions."""
             SearchResult: Search result
         """
         logger.info(t("console.quickSearchStart", query=query[:50]))
+
+        scope = getattr(self, "_report_scope", None)
+        cache_key = None
+        if scope is not None and scope.graph_id == graph_id:
+            try:
+                norm_q = normalize_zep_search_query(query)
+                norm_limit = normalize_zep_search_limit(limit)
+            except ValueError:
+                norm_q = (query or "").strip()
+                norm_limit = int(limit) if limit else 10
+            cache_key = (norm_q, norm_limit)
+            cached = scope.quick_search_cache.get(cache_key)
+            if cached is not None:
+                scope.quick_search_cache_hits += 1
+                logger.info(
+                    "Report scope cache hit: quick_search (query=%s, limit=%s)",
+                    norm_q[:50],
+                    norm_limit,
+                )
+                return cached
         
         # Directly call the existing search_graph method
         result = self.search_graph(
@@ -1263,6 +1664,10 @@ Return a JSON list of sub-questions."""
             limit=limit,
             scope="edges"
         )
+
+        if scope is not None and scope.graph_id == graph_id and cache_key is not None:
+            scope.quick_search_cache[cache_key] = result
+            scope.quick_search_network_fetches += 1
         
         logger.info(t("console.quickSearchComplete", count=result.total_count))
         return result
