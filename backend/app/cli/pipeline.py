@@ -168,8 +168,8 @@ def _wait_for_simulation_terminal(
             try:
                 result = SimulationRunner.close_simulation_env(simulation_id)
                 if isinstance(result, dict) and not result.get("success", True):
-                    # Keep the first soft-failure detail; a later soft-success
-                    # (e.g. timeout treated as success) must not wipe diagnostics.
+                    # Keep soft-failure detail across later soft-success; do not
+                    # clear on success (e.g. timeout treated as success).
                     last_close_error = str(
                         result.get("message") or result.get("error") or result
                     )
@@ -417,21 +417,23 @@ def run_pipeline(
 
         return registry.update(record.run_id, status="completed")
     except Exception as exc:
-        registry.update(record.run_id, status="failed", error=str(exc))
+        # registry.update returns a fresh disk record; local `record` is stale
+        # for mid-pipeline ids (project/simulation/report).
+        failed = registry.update(record.run_id, status="failed", error=str(exc))
         if isinstance(exc, PipelineError):
             if not exc.run_id:
-                exc.run_id = record.run_id
+                exc.run_id = failed.run_id
             if not exc.project_id:
-                exc.project_id = record.project_id
+                exc.project_id = failed.project_id
             if not exc.simulation_id:
-                exc.simulation_id = record.simulation_id
+                exc.simulation_id = failed.simulation_id
             if not exc.report_id:
-                exc.report_id = record.report_id
+                exc.report_id = failed.report_id
             raise
         raise PipelineError(
             str(exc),
-            run_id=record.run_id,
-            project_id=record.project_id,
-            simulation_id=record.simulation_id,
-            report_id=record.report_id,
+            run_id=failed.run_id,
+            project_id=failed.project_id,
+            simulation_id=failed.simulation_id,
+            report_id=failed.report_id,
         ) from exc

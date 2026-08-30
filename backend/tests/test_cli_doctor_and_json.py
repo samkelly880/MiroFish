@@ -1,6 +1,8 @@
 import json
 import os
 
+import pytest
+
 from app.cli.main import main
 from app.cli.verdict import normalize_verdict
 from app.run_registry import RunRegistry
@@ -103,6 +105,101 @@ def test_pipeline_error_attaches_run_id_on_wrap():
     assert err.project_id == "proj_1"
     assert err.simulation_id is None
     assert str(err) == "x"
+
+
+def test_run_pipeline_failure_ids_come_from_fresh_registry_record(tmp_path, monkeypatch):
+    """Local RunRecord stays stale; except must use registry.update's return value."""
+    from app.cli.pipeline import PipelineError, run_pipeline
+    from app.config import Config
+    from app.run_registry import RunRegistry
+
+    registry = RunRegistry(root_dir=str(tmp_path))
+    src = tmp_path / "doc.txt"
+    src.write_text("hello world", encoding="utf-8")
+
+    monkeypatch.setattr(Config, "validate", staticmethod(lambda: []))
+
+    class FakeProject:
+        project_id = "proj_live"
+        simulation_requirement = ""
+        total_text_length = 0
+        ontology = None
+        analysis_summary = ""
+        status = None
+        graph_id = None
+        files = []
+
+    class FakePM:
+        @staticmethod
+        def create_project(name):
+            del name
+            return FakeProject()
+
+        @staticmethod
+        def save_project(project):
+            del project
+
+        @staticmethod
+        def get_project(project_id):
+            del project_id
+            return FakeProject()
+
+        @staticmethod
+        def save_extracted_text(project_id, text):
+            del project_id, text
+
+        @staticmethod
+        def _get_project_files_dir(project_id):
+            d = tmp_path / "proj_files" / project_id
+            d.mkdir(parents=True, exist_ok=True)
+            return str(d)
+
+    monkeypatch.setattr("app.cli.pipeline.ProjectManager", FakePM)
+    monkeypatch.setattr(
+        "app.cli.pipeline.FileParser.extract_text",
+        staticmethod(lambda path: "hello world"),
+    )
+    monkeypatch.setattr(
+        "app.cli.pipeline.TextProcessor.preprocess_text",
+        staticmethod(lambda text: text),
+    )
+
+    def fake_ontology_generate(**kwargs):
+        del kwargs
+        return {"entity_types": [], "edge_types": [], "analysis_summary": "ok"}
+
+    monkeypatch.setattr(
+        "app.cli.pipeline.OntologyGenerator.generate",
+        lambda self, **kwargs: fake_ontology_generate(**kwargs),
+    )
+
+    def boom_build_async(**kwargs):
+        del kwargs
+        # Simulate mid-pipeline failure after registry already has project_id.
+        raise RuntimeError("graph boom")
+
+    class FakeBuilder:
+        def build_graph_async(self, **kwargs):
+            return boom_build_async(**kwargs)
+
+    monkeypatch.setattr("app.cli.pipeline.GraphBuilderService", FakeBuilder)
+
+    # Seed project_id onto the registry row the way run_pipeline does, then
+    # force failure after that update by patching deeper — easier: wrap update
+    # is exercised when Ontology succeeds and graph fails after project_id set.
+    # run_pipeline sets project_id before ontology; graph is after ontology.
+    with pytest.raises(PipelineError) as caught:
+        run_pipeline(
+            files=[str(src)],
+            requirement="req",
+            registry=registry,
+            skip_report=True,
+            skip_verdict=True,
+        )
+    err = caught.value
+    assert err.run_id
+    assert err.project_id == "proj_live"
+    assert "graph boom" in str(err)
 
 
 def test_normalize_verdict_insufficient():
