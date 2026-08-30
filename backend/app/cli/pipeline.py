@@ -20,7 +20,7 @@ from ..models.task import TaskManager, TaskStatus
 from ..run_registry import RunRegistry, RunRecord
 from ..services.graph_builder import GraphBuilderService
 from ..services.ontology_generator import OntologyGenerator
-from ..services.report_agent import ReportAgent, ReportManager
+from ..services.report_agent import ReportAgent, ReportManager, ReportStatus
 from ..services.simulation_manager import SimulationManager
 from ..services.simulation_runner import RunnerStatus, SimulationRunner
 from ..services.text_processor import TextProcessor
@@ -37,6 +37,14 @@ class PipelineError(RuntimeError):
 def _progress(cb: Optional[ProgressCallback], stage: str, **payload: Any) -> None:
     if cb:
         cb(stage, payload)
+
+
+def _ensure_report_succeeded(report: Any) -> None:
+    """Raise if ReportAgent returned a non-COMPLETED status (it catches internally)."""
+    if report.status != ReportStatus.COMPLETED:
+        raise PipelineError(
+            report.error or f"Report generation failed (report_id={report.report_id})"
+        )
 
 
 def _platform_flags(platform: str) -> Dict[str, bool]:
@@ -361,6 +369,10 @@ def run_pipeline(
             report = agent.generate_report(report_id=report_id)
             ReportManager.save_report(report)
             report_id = report.report_id
+            registry.update(record.run_id, report_id=report_id)
+            # ReportAgent catches exceptions and returns status=FAILED; mirror the
+            # web API and fail the CLI run instead of marking it completed.
+            _ensure_report_succeeded(report)
             full_path = os.path.join(
                 Config.UPLOAD_FOLDER, "reports", report_id, "full_report.md"
             )
@@ -371,7 +383,6 @@ def run_pipeline(
                 shutil.copy2(full_path, dest)
                 registry.update(
                     record.run_id,
-                    report_id=report_id,
                     artifacts={"report/report.md": dest},
                 )
 
