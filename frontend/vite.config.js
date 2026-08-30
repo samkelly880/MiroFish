@@ -14,6 +14,11 @@ export default defineConfig({
   server: {
     port: 3000,
     open: true,
+    // Allow Caddy / reverse-proxy hostnames (e.g. hawk-geek-app1.i.ynet.nz)
+    allowedHosts: [
+      'hawk-geek-app1.i.ynet.nz',
+      '.i.ynet.nz',
+    ],
     proxy: {
       '/api': {
         target: 'http://localhost:5001',
