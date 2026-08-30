@@ -142,7 +142,17 @@ def cmd_run(args: argparse.Namespace) -> int:
             progress=on_progress,
         )
     except PipelineError as exc:
-        return emit_error(str(exc), as_json=args.json)
+        extras = {
+            key: value
+            for key, value in {
+                "run_id": exc.run_id,
+                "project_id": exc.project_id,
+                "simulation_id": exc.simulation_id,
+                "report_id": exc.report_id,
+            }.items()
+            if value
+        }
+        return emit_error(str(exc), as_json=args.json, **extras)
     except Exception as exc:  # noqa: BLE001
         return emit_error(str(exc), as_json=args.json)
 

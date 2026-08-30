@@ -58,6 +58,53 @@ def test_inspect_unknown_run(capsys, tmp_path):
     assert payload["ok"] is False
 
 
+def test_run_json_error_includes_pipeline_ids(capsys, monkeypatch, tmp_path):
+    from app.cli import main as cli_main
+    from app.cli.pipeline import PipelineError
+
+    def boom(**kwargs):
+        del kwargs
+        raise PipelineError(
+            "report boom",
+            run_id="run_abc",
+            simulation_id="sim_1",
+            report_id="report_9",
+        )
+
+    monkeypatch.setattr(cli_main, "run_pipeline", boom)
+    code = main(
+        [
+            "run",
+            "--files",
+            str(tmp_path / "missing.txt"),
+            "--requirement",
+            "req",
+            "--output-dir",
+            str(tmp_path),
+            "--json",
+        ]
+    )
+    # --files is validated inside run_pipeline; our mock replaces it, so args reach cmd_run.
+    # Create a dummy file so argparse/path isn't the issue — cmd_run catches PipelineError.
+    payload = json.loads(capsys.readouterr().out)
+    assert code == 1
+    assert payload["ok"] is False
+    assert payload["error"] == "report boom"
+    assert payload["run_id"] == "run_abc"
+    assert payload["simulation_id"] == "sim_1"
+    assert payload["report_id"] == "report_9"
+
+
+def test_pipeline_error_attaches_run_id_on_wrap():
+    from app.cli.pipeline import PipelineError
+
+    err = PipelineError("x", run_id="run_1", project_id="proj_1")
+    assert err.run_id == "run_1"
+    assert err.project_id == "proj_1"
+    assert err.simulation_id is None
+    assert str(err) == "x"
+
+
 def test_normalize_verdict_insufficient():
     verdict = normalize_verdict(
         {

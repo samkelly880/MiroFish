@@ -33,6 +33,21 @@ ProgressCallback = Callable[[str, Dict[str, Any]], None]
 class PipelineError(RuntimeError):
     """Raised when the CLI pipeline cannot continue."""
 
+    def __init__(
+        self,
+        message: str,
+        *,
+        run_id: Optional[str] = None,
+        project_id: Optional[str] = None,
+        simulation_id: Optional[str] = None,
+        report_id: Optional[str] = None,
+    ) -> None:
+        super().__init__(message)
+        self.run_id = run_id
+        self.project_id = project_id
+        self.simulation_id = simulation_id
+        self.report_id = report_id
+
 
 def _progress(cb: Optional[ProgressCallback], stage: str, **payload: Any) -> None:
     if cb:
@@ -43,7 +58,8 @@ def _ensure_report_succeeded(report: Any) -> None:
     """Raise if ReportAgent returned a non-COMPLETED status (it catches internally)."""
     if report.status != ReportStatus.COMPLETED:
         raise PipelineError(
-            report.error or f"Report generation failed (report_id={report.report_id})"
+            report.error or f"Report generation failed (report_id={report.report_id})",
+            report_id=getattr(report, "report_id", None),
         )
 
 
@@ -152,6 +168,8 @@ def _wait_for_simulation_terminal(
             try:
                 result = SimulationRunner.close_simulation_env(simulation_id)
                 if isinstance(result, dict) and not result.get("success", True):
+                    # Keep the first soft-failure detail; a later soft-success
+                    # (e.g. timeout treated as success) must not wipe diagnostics.
                     last_close_error = str(
                         result.get("message") or result.get("error") or result
                     )
@@ -162,8 +180,6 @@ def _wait_for_simulation_terminal(
                         error=last_close_error,
                         attempt=close_attempts + 1,
                     )
-                else:
-                    last_close_error = None
             except Exception as exc:  # noqa: BLE001 - keep waiting/monitor owns terminal state
                 last_close_error = str(exc)
                 _progress(
@@ -402,4 +418,20 @@ def run_pipeline(
         return registry.update(record.run_id, status="completed")
     except Exception as exc:
         registry.update(record.run_id, status="failed", error=str(exc))
-        raise
+        if isinstance(exc, PipelineError):
+            if not exc.run_id:
+                exc.run_id = record.run_id
+            if not exc.project_id:
+                exc.project_id = record.project_id
+            if not exc.simulation_id:
+                exc.simulation_id = record.simulation_id
+            if not exc.report_id:
+                exc.report_id = record.report_id
+            raise
+        raise PipelineError(
+            str(exc),
+            run_id=record.run_id,
+            project_id=record.project_id,
+            simulation_id=record.simulation_id,
+            report_id=record.report_id,
+        ) from exc

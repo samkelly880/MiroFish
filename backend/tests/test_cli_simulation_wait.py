@@ -222,6 +222,49 @@ def test_wait_records_soft_close_failure(monkeypatch):
     assert fake.close_calls == 2
 
 
+def test_wait_keeps_earlier_soft_failure_after_later_soft_success(monkeypatch):
+    running = SimpleNamespace(runner_status=RunnerStatus.RUNNING, error=None)
+    fake = FakeRunner([running], platforms_completed_at=0)
+    clock = {"t": 0.0}
+    calls = {"n": 0}
+
+    def mixed_close(simulation_id):
+        del simulation_id
+        calls["n"] += 1
+        fake.close_calls += 1
+        if calls["n"] == 1:
+            return {"success": False, "message": "IPC rejected close"}
+        return {"success": True, "message": "timeout treated as success"}
+
+    monkeypatch.setattr(
+        "app.cli.pipeline.SimulationRunner.get_run_state",
+        fake.get_run_state,
+    )
+    monkeypatch.setattr(
+        "app.cli.pipeline.SimulationRunner._check_all_platforms_completed",
+        fake._check_all_platforms_completed,
+    )
+    monkeypatch.setattr(
+        "app.cli.pipeline.SimulationRunner.close_simulation_env",
+        mixed_close,
+    )
+    monkeypatch.setattr("app.cli.pipeline.time.time", lambda: clock["t"])
+
+    def fake_sleep(seconds):
+        clock["t"] += max(seconds, 1.0)
+
+    monkeypatch.setattr("app.cli.pipeline.time.sleep", fake_sleep)
+
+    with pytest.raises(PipelineError, match="IPC rejected close"):
+        _wait_for_simulation_terminal(
+            simulation_id="sim_x",
+            poll_seconds=1,
+            timeout_seconds=7200,
+            post_close_grace_seconds=120,
+        )
+    assert fake.close_calls == 2
+
+
 def test_wait_fails_fast_after_exhausted_close_attempts(monkeypatch):
     running = SimpleNamespace(runner_status=RunnerStatus.RUNNING, error=None)
     fake = FakeRunner(
