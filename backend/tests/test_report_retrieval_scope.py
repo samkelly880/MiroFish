@@ -504,7 +504,7 @@ def test_compact_insight_observation_when_reused():
 
     reused = tools.insight_forge(
         graph_id="graph_a",
-        query="Section query about activists",
+        query="How would businesses react to the fee on social media?",
         simulation_requirement="How would businesses react?",
     )
     assert reused.reused_from_canonical is True
@@ -641,9 +641,10 @@ def test_observation_size_reduction_vs_full_dumps():
     # After Opt2: shared once + compact insight/panorama + full quick
     reused = tools.insight_forge(
         graph_id="graph_a",
-        query="section flavored",
+        query="How would businesses react in this section?",
         simulation_requirement="How would businesses react?",
     )
+    assert reused.reused_from_canonical is True
     compact_insight = tools.format_insight_observation(reused)
     compact_pan = tools.format_panorama_observation(pan)
     after_per_section = len(compact_insight) + len(compact_pan) + len(quick)
@@ -686,7 +687,7 @@ def test_timing_insight_reuse_vs_full():
     for i in range(3):
         tools.insight_forge(
             graph_id="graph_a",
-            query=f"Section-flavored query {i} about businesses and activists",
+            query=f"How would businesses react in section flavor {i}?",
             simulation_requirement="How would businesses react?",
         )
     reused = time.perf_counter() - t1
